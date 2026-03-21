@@ -13,6 +13,8 @@
 // limitations under the License.
 #pragma once 
 namespace tv {
+#if ((__CUDACC_VER_MAJOR__ >= 13) || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 6))
+#else 
 enum  {
     FP_NAN =
 # define FP_NAN 0
@@ -30,6 +32,6 @@ enum  {
 # define FP_NORMAL 4
       FP_NORMAL
 };
-
+#endif
 }
 
