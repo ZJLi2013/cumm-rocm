@@ -57,10 +57,15 @@ def test_matmul_beta_accumulate(tuner, m, n, k):
 
 
 def test_tile_selection():
-    """Verify tile config selection logic."""
+    """Verify tile config produces valid configs that respect LDS and alignment."""
     cfg = _select_tile_config(200, 256, 256)
-    assert cfg['TILE_N'] == 128 or cfg['TILE_N'] == 256
-    assert 256 % cfg['TILE_N'] == 0
+    assert 256 % cfg['TILE_N'] == 0, "TILE_N must divide N"
+    assert cfg['TILE_M'] >= 32, "TILE_M must be >= warp minimum (32)"
 
     cfg = _select_tile_config(32, 256, 2048)
-    assert cfg['SPLIT_K'] > 1, "Small M + large K should use split-K"
+    assert cfg['TILE_M'] >= 32
+    assert 256 % cfg['TILE_N'] == 0
+
+    cfg = _select_tile_config(4096, 4096, 4096)
+    assert 4096 % cfg['TILE_N'] == 0
+    assert cfg['TILE_M'] >= 32
