@@ -6,7 +6,7 @@ from pathlib import Path
 
 here = Path(__file__).parent
 long_description = (here / "README.md").read_text(encoding="utf-8")
-version = "0.9.0.rocm1"
+version = "0.9.0+rocm1"
 
 setup(
     name="cumm-rocm",
