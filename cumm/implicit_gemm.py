@@ -108,6 +108,7 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
     LDG_VEC = min(4, W_ELEMS)
     W_LOAD_PER_THREAD = math.ceil(W_ELEMS / BLOCK_M)
     W_VEC_LOAD_PER_THREAD = math.ceil(W_ELEMS / (BLOCK_M * LDG_VEC))
+    LOAD_ITERS = W_LOAD_PER_THREAD
 
     def _make_kernel(is_f32=True, use_f16=True):
         """Unified kernel factory for f32/f16/bf16.
@@ -128,6 +129,7 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
                    mask: fx.Tensor, pair_start: fx.Tensor, pair_end: fx.Tensor,
                    num_act_out_val: fx.Int32):
             dt = T.f32 if const_expr(DT_TAG == 'f32') else (T.f16 if const_expr(DT_TAG == 'f16') else T.bf16)
+            _unused_fv = (fly_values, fly, llvm, OUT_DT_BYTES, LOAD_ITERS)
             tid = fx.Int32(gpu.thread_idx.x)
             bid = fx.Int32(gpu.block_idx.x)
 
