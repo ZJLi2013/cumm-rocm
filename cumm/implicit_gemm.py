@@ -119,12 +119,15 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
         - Output buffer as accumulator (read-modify-write), avoids SSA threading
           through nested scf.IfOp/ForOp
         """
+        NEED_EXTF = not is_f32
+        DT_TAG = 'f32' if is_f32 else ('f16' if use_f16 else 'bf16')
+
         @flyc.kernel(known_block_size=[BLOCK_M, 1, 1])
         def kernel(features: fx.Tensor, weights: fx.Tensor, output: fx.Tensor,
                    sorted_inp: fx.Tensor, sorted_out: fx.Tensor,
                    mask: fx.Tensor, pair_start: fx.Tensor, pair_end: fx.Tensor,
                    num_act_out_val: fx.Int32):
-            dt = T.f32 if const_expr(is_f32) else (T.f16 if const_expr(use_f16) else T.bf16)
+            dt = T.f32 if const_expr(DT_TAG == 'f32') else (T.f16 if const_expr(DT_TAG == 'f16') else T.bf16)
             tid = fx.Int32(gpu.thread_idx.x)
             bid = fx.Int32(gpu.block_idx.x)
 
@@ -193,14 +196,14 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
                                     # Dot product: sum over C_IN
                                     for c in range_constexpr(C_IN):
                                         f_val = feat_.load(feat_base + fx.Index(const_expr(c)))
-                                        if const_expr(not is_f32):
-                                            f_val = arith.extf(T.f32, f_val)
+                                    if const_expr(NEED_EXTF):
+                                        f_val = arith.extf(T.f32, f_val)
                                         f_bcast = vector.broadcast(
                                             T.vec(const_expr(OUT_VEC), T.f32), f_val)
 
                                         w_off = fx.Index(const_expr(c * C_OUT + j * OUT_VEC))
                                         w_vec = w_lds.vec_load((w_off,), const_expr(OUT_VEC))
-                                        if const_expr(not is_f32):
+                                        if const_expr(NEED_EXTF):
                                             w_f32_elems = []
                                             for ve in range_constexpr(OUT_VEC):
                                                 e = vector.extract(w_vec,
