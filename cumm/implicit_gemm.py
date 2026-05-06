@@ -119,7 +119,7 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
                         f_val = feat_.load(f_off)
                         w_lds_idx = fx.Index(const_expr(c * C_OUT + j))
                         w_val = w_lds[w_lds_idx]
-                        acc = arith.FMAOp(f_val, w_val, acc, fastmath=arith.FastMathFlags.fast)
+                        acc = f_val * w_val + acc
                     out_elem_off = out_row_base + fx.Index(const_expr(j))
                     byte_off = arith.index_cast(T.i64, out_elem_off * fx.Index(const_expr(OUT_DT_BYTES)))
                     addr_i64 = llvm.AddOp(out_base_int, byte_off, llvm.IntegerOverflowFlags(0)).result
@@ -183,7 +183,7 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
                         w_lds_idx = fx.Index(const_expr(c * C_OUT + j))
                         w_val = w_lds[w_lds_idx]
                         w_f32 = arith.ExtFOp(T.f32, w_val)
-                        acc = arith.FMAOp(f_f32, w_f32, acc, fastmath=arith.FastMathFlags.fast)
+                        acc = f_f32 * w_f32 + acc
                     out_elem_off = out_row_base + fx.Index(const_expr(j))
                     byte_off = arith.index_cast(T.i64, out_elem_off * fx.Index(const_expr(OUT_DT_BYTES)))
                     addr_i64 = llvm.AddOp(out_base_int, byte_off, llvm.IntegerOverflowFlags(0)).result
