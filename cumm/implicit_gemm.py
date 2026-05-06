@@ -69,11 +69,9 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
     from flydsl.expr import gpu, arith, range_constexpr, const_expr, buffer_ops, rocdl
     from flydsl.expr.typing import T
     from flydsl._mlir import ir
-    from flydsl._mlir.dialects import scf, llvm
+    from flydsl._mlir.dialects import scf
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.compiler.protocol import fly_values
-    from flydsl._mlir.dialects import fly
     from kernels.tensor_shim import GTensor, STensor
 
     C_IN = c_in
@@ -129,7 +127,6 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
                    mask: fx.Tensor, pair_start: fx.Tensor, pair_end: fx.Tensor,
                    num_act_out_val: fx.Int32):
             dt = T.f32 if const_expr(DT_TAG == 'f32') else (T.f16 if const_expr(DT_TAG == 'f16') else T.bf16)
-            _unused_fv = (fly_values, fly, llvm, OUT_DT_BYTES, LOAD_ITERS)
             tid = fx.Int32(gpu.thread_idx.x)
             bid = fx.Int32(gpu.block_idx.x)
 
