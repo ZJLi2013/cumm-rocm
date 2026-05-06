@@ -62,7 +62,7 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
     from flydsl.expr.typing import T
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import scf, llvm
-    from flydsl.utils.smem_allocator import SmemAllocator
+    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
     from flydsl.compiler.kernel_function import CompilationContext
     from flydsl.compiler.protocol import fly_values
     from flydsl._mlir.dialects import fly
@@ -88,9 +88,11 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
-    # LDS for weight tile
+    # LDS for weight tile (manual offset management, matching hgemm_splitk pattern)
     allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig")
-    lds_w = allocator.allocate_array(dt, W_ELEMS)
+    smem_w_offset = allocator._align(allocator.ptr, 16)
+    W_BYTES = W_ELEMS * DT_BYTES
+    allocator.ptr = smem_w_offset + W_BYTES
 
     # How many iterations each thread does to cooperatively load weight to LDS
     LOAD_ITERS = math.ceil(W_ELEMS / BLOCK_M)
@@ -122,9 +124,10 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
         k_pos = kpos_.load(fx.Index(bid))
         n_valid = tpc_.load(fx.Index(bid))
 
-        # LDS base
+        # LDS for weight: SmemPtr → STensor (matches hgemm_splitk pattern)
         base_ptr = allocator.get_base()
-        w_lds = STensor(base_ptr, dt, shape=(W_ELEMS,))
+        smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, dt, shape=(W_ELEMS,))
+        w_lds = STensor(smem_w_ptr, dt, shape=(W_ELEMS,))
 
         # --- Cooperative weight loading to LDS ---
         w_base_offset = fx.Index(k_pos) * fx.Index(const_expr(W_ELEMS))
@@ -152,6 +155,12 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
             feat_row_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
             out_row_base = fx.Index(out_row) * fx.Index(const_expr(C_OUT))
 
+            # Extract output base pointer once (hoisted from inner loop)
+            _ptr_type = ir.Type.parse("!llvm.ptr<1>")
+            out_raw = fly_values(output)[0]
+            out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
+            out_base_int = llvm.PtrToIntOp(T.i64, out_base_ptr).result
+
             # Compute output[out_row, j] += sum_c(features[inp_row, c] * weight[c, j])
             for j in range_constexpr(C_OUT):
                 acc = arith.constant(0.0, type=T.f32)
@@ -175,11 +184,6 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
                                       fastmath=arith.FastMathFlags.fast)
 
                 # Atomic f32 add to output
-                _ptr_type = ir.Type.parse("!llvm.ptr<1>")
-                out_raw = fly_values(output)[0]
-                out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
-                out_base_int = llvm.PtrToIntOp(T.i64, out_base_ptr).result
-
                 out_elem_off = out_row_base + fx.Index(const_expr(j))
                 byte_off = arith.index_cast(T.i64, out_elem_off * fx.Index(const_expr(OUT_DT_BYTES)))
                 addr_i64 = llvm.AddOp(out_base_int, byte_off, llvm.IntegerOverflowFlags(0)).result
