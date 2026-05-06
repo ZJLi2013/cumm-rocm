@@ -238,54 +238,78 @@ def preprocess_pairs(
     indice_pair_num: torch.Tensor,
     block_m: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Sort pairs within each kv group by inp_indices for coalesced access."""
+    """Sort pairs within each kv group by inp_indices for coalesced access.
+
+    Vectorized: flatten all kv, single sort with composite key
+    (kv_pos << 32 | inp_index), then tile layout via pre-allocated buffers.
+    """
     kv = indice_pairs.shape[0]
     device = indice_pairs.device
     pair_num_cpu = indice_pair_num.cpu().int().numpy()
 
-    tile_kpos_list = []
-    tile_pair_count_list = []
-    inp_flat_list = []
-    out_flat_list = []
+    total_pairs = int(pair_num_cpu.sum())
+    if total_pairs == 0:
+        empty = torch.zeros(0, dtype=torch.int32, device=device)
+        return empty, empty, empty, empty, 0
 
+    num_tiles_per_kv = [(int(n) + block_m - 1) // block_m if n > 0 else 0
+                        for n in pair_num_cpu]
+    num_tiles = sum(num_tiles_per_kv)
+    if num_tiles == 0:
+        empty = torch.zeros(0, dtype=torch.int32, device=device)
+        return empty, empty, empty, empty, 0
+
+    # Flatten all valid pairs into contiguous buffers, preserving kv grouping
+    all_inp = torch.empty(total_pairs, dtype=torch.int32, device=device)
+    all_out = torch.empty(total_pairs, dtype=torch.int32, device=device)
+    all_kv = torch.empty(total_pairs, dtype=torch.int32, device=device)
+
+    offset = 0
+    for k in range(kv):
+        nhot = int(pair_num_cpu[k])
+        if nhot <= 0:
+            continue
+        all_inp[offset:offset + nhot] = indice_pairs[k, 0, :nhot]
+        all_out[offset:offset + nhot] = indice_pairs[k, 1, :nhot]
+        all_kv[offset:offset + nhot] = k
+        offset += nhot
+
+    # Single sort: composite key = kv_pos * large_stride + inp_index
+    # ensures within-kv sorting by inp_index, cross-kv grouping by kv_pos
+    max_idx = int(all_inp.max().item()) + 1
+    sort_key = all_kv.long() * max_idx + all_inp.long()
+    sorted_order = torch.argsort(sort_key)
+    all_inp = all_inp[sorted_order]
+    all_out = all_out[sorted_order]
+    all_kv = all_kv[sorted_order]
+
+    # Build tile layout: pre-allocate padded buffers
+    total_padded = num_tiles * block_m
+    inp_flat = torch.zeros(total_padded, dtype=torch.int32, device=device)
+    out_flat = torch.zeros(total_padded, dtype=torch.int32, device=device)
+    tile_kpos = torch.empty(num_tiles, dtype=torch.int32, device=device)
+    tile_pair_count = torch.empty(num_tiles, dtype=torch.int32, device=device)
+
+    tile_idx = 0
+    flat_offset = 0
+    src_offset = 0
     for k in range(kv):
         nhot = int(pair_num_cpu[k])
         if nhot <= 0:
             continue
 
-        inp_k = indice_pairs[k, 0, :nhot]
-        out_k = indice_pairs[k, 1, :nhot]
+        inp_flat[flat_offset:flat_offset + nhot] = all_inp[src_offset:src_offset + nhot]
+        out_flat[flat_offset:flat_offset + nhot] = all_out[src_offset:src_offset + nhot]
 
-        sorted_order = torch.argsort(inp_k)
-        inp_k = inp_k[sorted_order]
-        out_k = out_k[sorted_order]
+        n_tiles_k = num_tiles_per_kv[k]
+        tile_kpos[tile_idx:tile_idx + n_tiles_k] = k
+        for t in range(n_tiles_k):
+            n_valid = min(block_m, nhot - t * block_m)
+            tile_pair_count[tile_idx + t] = n_valid
 
-        for tile_start in range(0, nhot, block_m):
-            tile_end = min(tile_start + block_m, nhot)
-            n_valid = tile_end - tile_start
-
-            inp_tile = inp_k[tile_start:tile_end]
-            out_tile = out_k[tile_start:tile_end]
-
-            if n_valid < block_m:
-                pad = block_m - n_valid
-                inp_tile = torch.cat([inp_tile, torch.zeros(pad, dtype=torch.int32, device=device)])
-                out_tile = torch.cat([out_tile, torch.zeros(pad, dtype=torch.int32, device=device)])
-
-            inp_flat_list.append(inp_tile)
-            out_flat_list.append(out_tile)
-            tile_kpos_list.append(k)
-            tile_pair_count_list.append(n_valid)
-
-    num_tiles = len(tile_kpos_list)
-    if num_tiles == 0:
-        empty = torch.zeros(0, dtype=torch.int32, device=device)
-        return empty, empty, empty, empty, 0
-
-    inp_flat = torch.cat(inp_flat_list).int().contiguous()
-    out_flat = torch.cat(out_flat_list).int().contiguous()
-    tile_kpos = torch.tensor(tile_kpos_list, dtype=torch.int32, device=device)
-    tile_pair_count = torch.tensor(tile_pair_count_list, dtype=torch.int32, device=device)
+        tile_idx += n_tiles_k
+        flat_offset += n_tiles_k * block_m
+        src_offset += nhot
 
     return inp_flat, out_flat, tile_kpos, tile_pair_count, num_tiles
 
