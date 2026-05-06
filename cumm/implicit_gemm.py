@@ -81,36 +81,63 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
     KV = kv
     BLOCK_M = 64
     W_ELEMS = C_IN * C_OUT
+    FEAT_VEC = min(4, C_IN)    # vectorized feature load width
+    OUT_VEC = min(4, C_OUT)    # vectorized output store width
+    C_IN_VECS = C_IN // FEAT_VEC
+    C_OUT_VECS = C_OUT // OUT_VEC
 
     if dtype_str == 'f32':
         DT_BYTES = 4
+        dt_key = 'f32'
     elif dtype_str in ('f16', 'bf16'):
         DT_BYTES = 2
+        dt_key = dtype_str
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
-    OUT_DT_BYTES = 4  # output is always f32
+    OUT_DT_BYTES = 4  # output accumulation always f32
 
-    allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig_v2")
+    # LDS: one full weight matrix [C_IN, C_OUT]
+    allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig_v3")
     smem_w_offset = allocator._align(allocator.ptr, 16)
     W_BYTES = W_ELEMS * DT_BYTES
     allocator.ptr = smem_w_offset + W_BYTES
 
-    LOAD_ITERS = math.ceil(W_ELEMS / BLOCK_M)
+    # Cooperative weight load: each thread loads W_ELEMS / BLOCK_M elements
+    # Use vec_load with LDG_VEC = 4 for efficiency
+    LDG_VEC = min(4, W_ELEMS)
+    W_LOAD_PER_THREAD = math.ceil(W_ELEMS / BLOCK_M)
+    W_VEC_LOAD_PER_THREAD = math.ceil(W_ELEMS / (BLOCK_M * LDG_VEC))
 
-    def _make_kernel_f32():
+    def _make_kernel(is_f32=True, use_f16=True):
+        """Unified kernel factory for f32/f16/bf16.
+
+        V3 improvements over V2:
+        - Vectorized cooperative weight load to LDS (vec_load/vec_store with LDG_VEC)
+        - Vectorized dot product: broadcast feat scalar × weight vec from LDS
+        - Non-atomic output store via GTensor.vec_store
+        - Output buffer as accumulator (read-modify-write), avoids SSA threading
+          through nested scf.IfOp/ForOp
+        """
+        if is_f32:
+            kern_dt = T.f32
+        elif use_f16:
+            kern_dt = T.f16
+        else:
+            kern_dt = T.bf16
+
         @flyc.kernel(known_block_size=[BLOCK_M, 1, 1])
         def kernel(features: fx.Tensor, weights: fx.Tensor, output: fx.Tensor,
                    sorted_inp: fx.Tensor, sorted_out: fx.Tensor,
                    mask: fx.Tensor, pair_start: fx.Tensor, pair_end: fx.Tensor,
                    num_act_out_val: fx.Int32):
-            _rc = range_constexpr
-            dt = T.f32
+            dt = kern_dt if const_expr(is_f32) else (T.f16 if const_expr(use_f16) else T.bf16)
             tid = fx.Int32(gpu.thread_idx.x)
             bid = fx.Int32(gpu.block_idx.x)
 
             feat_ = GTensor(features, dtype=dt, shape=(-1,))
             w_ = GTensor(weights, dtype=dt, shape=(-1,))
+            out_ = GTensor(output, dtype=T.f32, shape=(-1,))
             sinp_ = GTensor(sorted_inp, dtype=T.i32, shape=(-1,))
             sout_ = GTensor(sorted_out, dtype=T.i32, shape=(-1,))
             mask_ = GTensor(mask, dtype=T.i32, shape=(-1,))
@@ -122,21 +149,8 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
             w_lds = STensor(smem_w_ptr, dt, shape=(W_ELEMS,))
 
             my_out_row = fx.Int32(bid) * fx.Int32(const_expr(BLOCK_M)) + tid
-            is_valid_out = arith.cmpi(arith.CmpIPredicate.slt, my_out_row, num_act_out_val)
+            out_row_base = fx.Index(my_out_row) * fx.Index(const_expr(C_OUT))
 
-            # Accumulator for output: C_OUT values per thread
-            # Use raw pointer for output store (non-atomic)
-            _ptr_type = ir.Type.parse("!llvm.ptr<1>")
-            out_raw = fly_values(output)[0]
-            out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
-            out_base_int = llvm.PtrToIntOp(T.i64, out_base_ptr).result
-
-            # Initialize accumulators
-            # We'll accumulate across all kv positions, then store once
-            # Since range_constexpr C_OUT can be large, use array in registers
-            # FlyDSL doesn't have array; use output pointer directly after accumulation
-
-            # For each kv position, check mask and accumulate
             for k in range_constexpr(KV):
                 mask_idx = fx.Index(bid) * fx.Index(const_expr(KV)) + fx.Index(const_expr(k))
                 is_active = arith.cmpi(arith.CmpIPredicate.ne,
@@ -144,19 +158,19 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
                                        fx.Int32(arith.constant(0, type=T.i32)))
                 kv_if = scf.IfOp(is_active, results_=[], has_else=False)
                 with ir.InsertionPoint(kv_if.then_block):
-                    # Cooperative weight load to LDS
+                    # Phase 1: Cooperative weight load to LDS (vectorized)
                     w_base = fx.Index(const_expr(k * W_ELEMS))
-                    for wi in range_constexpr(LOAD_ITERS):
-                        w_idx = fx.Index(const_expr(wi * BLOCK_M)) + fx.Index(tid)
-                        w_valid = arith.cmpi(arith.CmpIPredicate.ult, w_idx, fx.Index(const_expr(W_ELEMS)))
+                    for wi in range_constexpr(W_VEC_LOAD_PER_THREAD):
+                        w_elem_idx = fx.Index(const_expr(wi * BLOCK_M * LDG_VEC)) + fx.Index(tid) * fx.Index(const_expr(LDG_VEC))
+                        w_valid = arith.cmpi(arith.CmpIPredicate.ult, w_elem_idx, fx.Index(const_expr(W_ELEMS)))
                         w_if = scf.IfOp(w_valid, results_=[], has_else=False)
                         with ir.InsertionPoint(w_if.then_block):
-                            w_val = w_.load(w_base + w_idx)
-                            w_lds[w_idx] = w_val
+                            w_vec = w_.vec_load((w_base + w_elem_idx,), const_expr(LDG_VEC))
+                            w_lds.vec_store((w_elem_idx,), w_vec, const_expr(LDG_VEC))
                             scf.YieldOp([])
                     gpu.barrier()
 
-                    # Each thread: find my pair in sorted arrays for this (tile, kv)
+                    # Phase 2: Per-thread pair scan + vectorized dot product
                     ps_idx = fx.Index(bid) * fx.Index(const_expr(KV)) + fx.Index(const_expr(k))
                     p_start = ps_.load(ps_idx)
                     p_end = pe_.load(ps_idx)
@@ -177,131 +191,53 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
                             with ir.InsertionPoint(mine_if.then_block):
                                 inp_row = sinp_.load(pi)
                                 feat_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
-                                out_row_base = fx.Index(my_out_row) * fx.Index(const_expr(C_OUT))
-                                for j in range_constexpr(C_OUT):
-                                    acc = arith.constant(0.0, type=T.f32)
+
+                                for j in range_constexpr(C_OUT_VECS):
+                                    # Load current output accumulator from global
+                                    out_off = out_row_base + fx.Index(const_expr(j * OUT_VEC))
+                                    acc = out_.vec_load((out_off,), const_expr(OUT_VEC))
+
+                                    # Dot product: sum over C_IN
                                     for c in range_constexpr(C_IN):
-                                        f_off = feat_base + fx.Index(const_expr(c))
-                                        f_val = feat_.load(f_off)
-                                        w_lds_idx = fx.Index(const_expr(c * C_OUT + j))
-                                        w_val = w_lds[w_lds_idx]
-                                        acc = f_val * w_val + acc
-                                    out_off = out_row_base + fx.Index(const_expr(j))
-                                    byte_off = arith.index_cast(T.i64, out_off * fx.Index(const_expr(OUT_DT_BYTES)))
-                                    addr_i64 = llvm.AddOp(out_base_int, byte_off, llvm.IntegerOverflowFlags(0)).result
-                                    addr_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
-                                    addr_v = addr_ptr._value if const_expr(hasattr(addr_ptr, "_value")) else addr_ptr
-                                    acc_v = acc._value if const_expr(hasattr(acc, "_value")) else acc
-                                    llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd, addr_v, acc_v,
-                                                     llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4)
+                                        f_val = feat_.load(feat_base + fx.Index(const_expr(c)))
+                                        if const_expr(not is_f32):
+                                            f_val = arith.extf(T.f32, f_val)
+                                        f_bcast = vector.broadcast(
+                                            T.vec(const_expr(OUT_VEC), T.f32), f_val)
+
+                                        w_off = fx.Index(const_expr(c * C_OUT + j * OUT_VEC))
+                                        w_vec = w_lds.vec_load((w_off,), const_expr(OUT_VEC))
+                                        if const_expr(not is_f32):
+                                            w_f32_elems = []
+                                            for ve in range_constexpr(OUT_VEC):
+                                                e = vector.extract(w_vec,
+                                                    static_position=[const_expr(ve)],
+                                                    dynamic_position=[])
+                                                w_f32_elems.append(arith.extf(T.f32, e))
+                                            w_f32 = vector.from_elements(
+                                                T.vec(const_expr(OUT_VEC), T.f32), w_f32_elems)
+                                        else:
+                                            w_f32 = w_vec
+
+                                        acc = arith.addf(acc, arith.mulf(f_bcast, w_f32))
+
+                                    # Store back
+                                    out_.vec_store((out_off,), acc, const_expr(OUT_VEC))
+
                                 scf.YieldOp([])
                             scf.YieldOp([])
                         scf.YieldOp([])
                     gpu.barrier()
                     scf.YieldOp([])
-        return kernel
 
-    def _make_kernel_fp16(use_f16=True):
-        @flyc.kernel(known_block_size=[BLOCK_M, 1, 1])
-        def kernel(features: fx.Tensor, weights: fx.Tensor, output: fx.Tensor,
-                   sorted_inp: fx.Tensor, sorted_out: fx.Tensor,
-                   mask: fx.Tensor, pair_start: fx.Tensor, pair_end: fx.Tensor,
-                   num_act_out_val: fx.Int32):
-            _rc = range_constexpr
-            dt = T.f16 if const_expr(use_f16) else T.bf16
-            tid = fx.Int32(gpu.thread_idx.x)
-            bid = fx.Int32(gpu.block_idx.x)
-
-            feat_ = GTensor(features, dtype=dt, shape=(-1,))
-            w_ = GTensor(weights, dtype=dt, shape=(-1,))
-            sinp_ = GTensor(sorted_inp, dtype=T.i32, shape=(-1,))
-            sout_ = GTensor(sorted_out, dtype=T.i32, shape=(-1,))
-            mask_ = GTensor(mask, dtype=T.i32, shape=(-1,))
-            ps_ = GTensor(pair_start, dtype=T.i32, shape=(-1,))
-            pe_ = GTensor(pair_end, dtype=T.i32, shape=(-1,))
-
-            base_ptr = allocator.get_base()
-            smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, dt, shape=(W_ELEMS,))
-            w_lds = STensor(smem_w_ptr, dt, shape=(W_ELEMS,))
-
-            my_out_row = fx.Int32(bid) * fx.Int32(const_expr(BLOCK_M)) + tid
-
-            _ptr_type = ir.Type.parse("!llvm.ptr<1>")
-            out_raw = fly_values(output)[0]
-            out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
-            out_base_int = llvm.PtrToIntOp(T.i64, out_base_ptr).result
-
-            for k in range_constexpr(KV):
-                mask_idx = fx.Index(bid) * fx.Index(const_expr(KV)) + fx.Index(const_expr(k))
-                is_active = arith.cmpi(arith.CmpIPredicate.ne,
-                                       mask_.load(mask_idx),
-                                       fx.Int32(arith.constant(0, type=T.i32)))
-                kv_if = scf.IfOp(is_active, results_=[], has_else=False)
-                with ir.InsertionPoint(kv_if.then_block):
-                    w_base = fx.Index(const_expr(k * W_ELEMS))
-                    for wi in range_constexpr(LOAD_ITERS):
-                        w_idx = fx.Index(const_expr(wi * BLOCK_M)) + fx.Index(tid)
-                        w_valid = arith.cmpi(arith.CmpIPredicate.ult, w_idx, fx.Index(const_expr(W_ELEMS)))
-                        w_if = scf.IfOp(w_valid, results_=[], has_else=False)
-                        with ir.InsertionPoint(w_if.then_block):
-                            w_val = w_.load(w_base + w_idx)
-                            w_lds[w_idx] = w_val
-                            scf.YieldOp([])
-                    gpu.barrier()
-
-                    ps_idx = fx.Index(bid) * fx.Index(const_expr(KV)) + fx.Index(const_expr(k))
-                    p_start = ps_.load(ps_idx)
-                    p_end = pe_.load(ps_idx)
-
-                    valid_thread = arith.cmpi(arith.CmpIPredicate.slt, my_out_row,
-                                              num_act_out_val)
-                    thread_if = scf.IfOp(valid_thread, results_=[], has_else=False)
-                    with ir.InsertionPoint(thread_if.then_block):
-                        p_start_idx = arith.index_cast(T.index, p_start)
-                        p_end_idx = arith.index_cast(T.index, p_end)
-                        step_idx = arith.constant(1, type=T.index)
-
-                        loop = scf.ForOp(p_start_idx, p_end_idx, step_idx, iter_args=[])
-                        with ir.InsertionPoint(loop.body):
-                            pi = loop.induction_variable
-                            pair_out = sout_.load(pi)
-                            is_mine = arith.cmpi(arith.CmpIPredicate.eq, pair_out, my_out_row)
-                            mine_if = scf.IfOp(is_mine, results_=[], has_else=False)
-                            with ir.InsertionPoint(mine_if.then_block):
-                                inp_row = sinp_.load(pi)
-                                feat_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
-                                out_row_base = fx.Index(my_out_row) * fx.Index(const_expr(C_OUT))
-                                for j in range_constexpr(C_OUT):
-                                    acc = arith.constant(0.0, type=T.f32)
-                                    for c in range_constexpr(C_IN):
-                                        f_off = feat_base + fx.Index(const_expr(c))
-                                        f_val = feat_.load(f_off)
-                                        f_f32 = arith.extf(T.f32, f_val)
-                                        w_lds_idx = fx.Index(const_expr(c * C_OUT + j))
-                                        w_val = w_lds[w_lds_idx]
-                                        w_f32 = arith.extf(T.f32, w_val)
-                                        acc = f_f32 * w_f32 + acc
-                                    out_off = out_row_base + fx.Index(const_expr(j))
-                                    byte_off = arith.index_cast(T.i64, out_off * fx.Index(const_expr(OUT_DT_BYTES)))
-                                    addr_i64 = llvm.AddOp(out_base_int, byte_off, llvm.IntegerOverflowFlags(0)).result
-                                    addr_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
-                                    addr_v = addr_ptr._value if const_expr(hasattr(addr_ptr, "_value")) else addr_ptr
-                                    acc_v = acc._value if const_expr(hasattr(acc, "_value")) else acc
-                                    llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd, addr_v, acc_v,
-                                                     llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4)
-                                scf.YieldOp([])
-                            scf.YieldOp([])
-                        scf.YieldOp([])
-                    gpu.barrier()
-                    scf.YieldOp([])
         return kernel
 
     if dtype_str == 'f32':
-        implicit_gemm_kernel = _make_kernel_f32()
+        implicit_gemm_kernel = _make_kernel(is_f32=True)
     elif dtype_str == 'f16':
-        implicit_gemm_kernel = _make_kernel_fp16(use_f16=True)
+        implicit_gemm_kernel = _make_kernel(is_f32=False, use_f16=True)
     else:
-        implicit_gemm_kernel = _make_kernel_fp16(use_f16=False)
+        implicit_gemm_kernel = _make_kernel(is_f32=False, use_f16=False)
 
     @flyc.jit
     def launch_fn(
