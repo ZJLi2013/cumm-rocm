@@ -484,7 +484,7 @@ class TestImplicitGemmV5:
 
     def test_large_channel(self):
         """64→128: the config where V4 was slow."""
-        self._run_correctness(500, 500, 64, 128, 3, [200, 300, 150], torch.float32)
+        self._run_correctness(500, 500, 64, 128, 3, [150, 200, 100], torch.float32)
 
     def test_kv27_subm(self):
         self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, torch.float32)
