@@ -1,16 +1,15 @@
-"""Unit tests for FlyDSL implicit GEMM kernel.
+"""Unit tests for FlyDSL implicit GEMM kernel (output-tile-centric).
 
 Tests focus on:
-1. Correctness: gather+GEMM+scatter vs explicit loop
-2. Memory layout: weight layout in LDS, feature access pattern
-3. Coalescing: sorted vs unsorted pair indices
-4. Edge cases: partial tiles, single pair, empty kv positions
+1. Legacy preprocessing (kv-centric, for backward compat)
+2. Mask generation (output-tile-centric: sort + mask + pair ranges)
+3. Kernel correctness: gather+GEMM+scatter vs explicit loop
+4. Memory layout: weight layout in LDS
+5. Edge cases: partial tiles, single pair, empty kv positions
 """
 import pytest
 import torch
 import numpy as np
-
-# ---------- host preprocessing tests (no GPU required) ----------
 
 from cumm.implicit_gemm import preprocess_pairs
 
@@ -31,14 +30,16 @@ def _make_pairs(kv, nhot_list, n_max=None, device="cpu"):
     return ip, ipn
 
 
+# ---------- Legacy preprocessing tests (CPU) ----------
+
 class TestPreprocessPairs:
-    """Test host-side pair preprocessing: sorting and tiling."""
+    """Test host-side pair preprocessing: sorting and tiling (kv-centric legacy)."""
 
     def test_basic_tiling(self):
         kv = 3
         ip, ipn = _make_pairs(kv, [64, 32, 0])
         inp_flat, out_flat, tile_kpos, tile_pc, n_tiles = preprocess_pairs(ip, ipn, block_m=64)
-        assert n_tiles == 2  # 64→1 tile, 32→1 tile, 0→skip
+        assert n_tiles == 2
         assert tile_kpos[0] == 0
         assert tile_kpos[1] == 1
         assert tile_pc[0] == 64
@@ -48,7 +49,7 @@ class TestPreprocessPairs:
     def test_multi_tile_single_kv(self):
         ip, ipn = _make_pairs(1, [150])
         _, _, tile_kpos, tile_pc, n_tiles = preprocess_pairs(ip, ipn, block_m=64)
-        assert n_tiles == 3  # ceil(150/64) = 3 tiles
+        assert n_tiles == 3
         assert (tile_kpos == 0).all()
         counts = tile_pc.numpy()
         assert counts[0] == 64
@@ -79,13 +80,145 @@ class TestPreprocessPairs:
         assert np.all(padded == 0), "Padded entries should be zero"
 
 
+# ---------- Mask generation tests (GPU) ----------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+class TestMaskGeneration:
+    """Test C++/HIP mask generation for output-tile-centric implicit GEMM."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_no_hip(self):
+        from cumm.implicit_gemm import _get_hip_module
+        if _get_hip_module() is None:
+            pytest.skip("HIP module not available")
+
+    def test_basic_mask(self):
+        """Verify mask marks correct (tile, kv) as active."""
+        from cumm.implicit_gemm import _get_hip_module
+        hip = _get_hip_module()
+
+        device = "cuda"
+        n_out = 128
+        block_m = 64
+        kv = 3
+
+        ip = torch.full((kv, 2, 50), -1, dtype=torch.int32, device=device)
+        ipn = torch.zeros(kv, dtype=torch.int32, device=device)
+
+        # kv=0: 20 pairs, all out_index in [0, 63] → tile 0 only
+        ip[0, 0, :20] = torch.randint(0, 100, (20,), dtype=torch.int32, device=device)
+        ip[0, 1, :20] = torch.randint(0, 64, (20,), dtype=torch.int32, device=device)
+        ipn[0] = 20
+
+        # kv=1: 30 pairs, out_index in [64, 127] → tile 1 only
+        ip[1, 0, :30] = torch.randint(0, 100, (30,), dtype=torch.int32, device=device)
+        ip[1, 1, :30] = torch.randint(64, 128, (30,), dtype=torch.int32, device=device)
+        ipn[1] = 30
+
+        # kv=2: 0 pairs
+        ipn[2] = 0
+
+        results = hip.build_implicit_gemm_mask(ip, ipn, n_out, block_m)
+        sorted_inp, sorted_out, sorted_kv, mask, pair_start, pair_end = results
+
+        mask_cpu = mask.cpu()
+        assert mask_cpu.shape == (2, 3)  # 2 tiles, 3 kv
+        assert mask_cpu[0, 0] == 1  # tile 0, kv 0 active
+        assert mask_cpu[0, 1] == 0  # tile 0, kv 1 inactive
+        assert mask_cpu[1, 0] == 0  # tile 1, kv 0 inactive
+        assert mask_cpu[1, 1] == 1  # tile 1, kv 1 active
+        assert mask_cpu[0, 2] == 0  # kv 2 always inactive
+        assert mask_cpu[1, 2] == 0
+
+    def test_sorted_by_kv_then_out(self):
+        """Verify sorted arrays are ordered by (kv, out_index)."""
+        from cumm.implicit_gemm import _get_hip_module
+        hip = _get_hip_module()
+
+        device = "cuda"
+        n_out, kv, block_m = 200, 3, 64
+
+        ip, ipn = _make_pairs(kv, [30, 50, 20], n_max=50, device=device)
+        ip[ip < 0] = 0
+        ip[:, 0] = ip[:, 0] % 100
+        ip[:, 1] = ip[:, 1] % n_out
+
+        results = hip.build_implicit_gemm_mask(ip, ipn, n_out, block_m)
+        sorted_inp, sorted_out, sorted_kv, mask, ps, pe = results
+
+        kv_cpu = sorted_kv.cpu().numpy()
+        out_cpu = sorted_out.cpu().numpy()
+
+        # kv values should be non-decreasing
+        assert np.all(kv_cpu[:-1] <= kv_cpu[1:]), "sorted_kv not non-decreasing"
+
+        # Within each kv group, out_index should be non-decreasing
+        for k in range(kv):
+            group_mask = kv_cpu == k
+            if group_mask.sum() > 0:
+                group_out = out_cpu[group_mask]
+                assert np.all(group_out[:-1] <= group_out[1:]), \
+                    f"kv={k}: out_index not sorted"
+
+    def test_pair_ranges_valid(self):
+        """Verify pair_start/pair_end ranges are consistent."""
+        from cumm.implicit_gemm import _get_hip_module
+        hip = _get_hip_module()
+
+        device = "cuda"
+        n_out, kv, block_m = 100, 2, 64
+
+        ip = torch.full((kv, 2, 40), -1, dtype=torch.int32, device=device)
+        ipn = torch.zeros(kv, dtype=torch.int32, device=device)
+        ip[0, 0, :20] = torch.arange(20, dtype=torch.int32, device=device)
+        ip[0, 1, :20] = torch.arange(20, dtype=torch.int32, device=device)
+        ipn[0] = 20
+        ip[1, 0, :15] = torch.arange(15, dtype=torch.int32, device=device)
+        ip[1, 1, :15] = torch.arange(15, dtype=torch.int32, device=device) + 50
+        ipn[1] = 15
+
+        results = hip.build_implicit_gemm_mask(ip, ipn, n_out, block_m)
+        _, sorted_out, sorted_kv, mask, ps, pe = results
+
+        mask_cpu = mask.cpu()
+        ps_cpu = ps.cpu()
+        pe_cpu = pe.cpu()
+
+        num_tiles = mask_cpu.shape[0]
+        for t in range(num_tiles):
+            for k in range(kv):
+                if mask_cpu[t, k] == 1:
+                    s = ps_cpu[t, k].item()
+                    e = pe_cpu[t, k].item()
+                    assert s < e, f"tile={t}, kv={k}: pair_start >= pair_end"
+                    # All pairs in [s, e) should have out_index in tile range
+                    tile_outs = sorted_out[s:e].cpu().numpy()
+                    assert np.all(tile_outs >= t * block_m), \
+                        f"tile={t}: out_index below tile range"
+                    assert np.all(tile_outs < (t + 1) * block_m), \
+                        f"tile={t}: out_index above tile range"
+
+    def test_total_pairs_preserved(self):
+        """Verify total number of pairs is preserved after mask generation."""
+        from cumm.implicit_gemm import _get_hip_module
+        hip = _get_hip_module()
+
+        device = "cuda"
+        ip, ipn = _make_pairs(5, [30, 0, 50, 0, 20], n_max=50, device=device)
+        ip[ip < 0] = 0
+        ip[:, 0] = ip[:, 0] % 200
+        ip[:, 1] = ip[:, 1] % 200
+
+        expected_total = int(ipn.sum().item())
+        results = hip.build_implicit_gemm_mask(ip, ipn, 200, 64)
+        sorted_inp = results[0]
+        assert sorted_inp.shape[0] == expected_total
+
+
 # ---------- GPU correctness tests ----------
 
 def _reference_gather_gemm_scatter(features, filters, indice_pairs, indice_pair_num, n_out):
-    """Reference: explicit Python loop over kv positions.
-
-    Always computes in f32 for comparison with implicit GEMM output.
-    """
+    """Reference: explicit Python loop over kv positions."""
     kv, c_in, c_out = filters.shape
     out = torch.zeros(n_out, c_out, dtype=torch.float32, device=features.device)
     for k in range(kv):
@@ -94,15 +227,15 @@ def _reference_gather_gemm_scatter(features, filters, indice_pairs, indice_pair_
             continue
         inp_ids = indice_pairs[k, 0, :nhot].long()
         out_ids = indice_pairs[k, 1, :nhot].long()
-        gathered = features[inp_ids].float()  # [nhot, c_in]
-        result = gathered @ filters[k].float()  # [nhot, c_out]
+        gathered = features[inp_ids].float()
+        result = gathered @ filters[k].float()
         out.index_add_(0, out_ids, result)
     return out
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 class TestImplicitGemmGPU:
-    """GPU tests for implicit GEMM kernel correctness."""
+    """GPU tests for output-tile-centric implicit GEMM kernel correctness."""
 
     @pytest.fixture(autouse=True)
     def _skip_no_flydsl(self):
@@ -159,89 +292,18 @@ class TestImplicitGemmGPU:
         self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, torch.float32)
 
 
-# ---------- Memory access pattern verification ----------
+# ---------- Memory layout verification ----------
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-class TestMemoryAccessPattern:
-    """Verify coalescing optimization effect."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_flydsl(self):
-        try:
-            import flydsl
-        except ImportError:
-            pytest.skip("FlyDSL not installed")
-
-    def test_sorted_indices_produce_sequential_access(self):
-        """After preprocessing, inp_indices within a tile should be sorted
-        (monotonically non-decreasing), enabling quasi-coalesced loads."""
-        n_in, kv = 500, 3
-        device = "cuda"
-        ip, ipn = _make_pairs(kv, [200, 150, 100], device=device)
-        ip[:, 0] = ip[:, 0].abs() % n_in
-        ip[:, 1] = ip[:, 1].abs() % n_in
-        inp_flat, _, _, tile_pc, n_tiles = preprocess_pairs(ip, ipn, block_m=64)
-        inp_cpu = inp_flat.cpu().numpy()
-        for t in range(n_tiles):
-            start = t * 64
-            n_valid = int(tile_pc[t].item())
-            tile_inp = inp_cpu[start:start+n_valid]
-            assert np.all(tile_inp[:-1] <= tile_inp[1:]), \
-                f"Tile {t}: inp_indices not sorted — coalescing broken"
+class TestMemoryLayout:
+    """Verify weight layout assumptions."""
 
     def test_weight_layout_row_major(self):
-        """Weight[k, c_in, c_out] is loaded to LDS as row-major (c_in * c_out).
-        Verify that LDS access pattern w_lds[c * C_OUT + j] is sequential
-        for the inner loop j (contiguous in LDS)."""
         c_in, c_out = 32, 32
         weight = torch.arange(c_in * c_out, dtype=torch.float32).reshape(c_in, c_out)
         for c in range(c_in):
             for j in range(c_out):
-                expected = weight[c, j].item()
                 lds_idx = c * c_out + j
                 assert lds_idx == c * c_out + j, "Weight LDS layout mismatch"
-
-
-# ---------- Coalescing benchmark ----------
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-class TestCoalescingBenchmark:
-    """Measure effect of sorting on performance (informational)."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_flydsl(self):
-        try:
-            import flydsl
-        except ImportError:
-            pytest.skip("FlyDSL not installed")
-
-    def test_sorted_vs_unsorted_indices(self):
-        """Compare performance with sorted vs random indices.
-        This is informational — we just verify both produce correct results."""
-        from cumm.implicit_gemm import implicit_gemm_forward
-
-        device = "cuda"
-        n_in, n_out, c_in, c_out = 500, 500, 32, 32
-        kv = 1
-        nhot = 200
-
-        features = torch.randn(n_in, c_in, dtype=torch.float32, device=device) * 0.1
-        filters = torch.randn(kv, c_in, c_out, dtype=torch.float32, device=device) * 0.1
-
-        sorted_inp = torch.sort(torch.randint(0, n_in, (nhot,), dtype=torch.int32, device=device))[0]
-        out_ids = torch.randperm(n_out, device=device)[:nhot].int()
-
-        ip = torch.zeros(1, 2, nhot, dtype=torch.int32, device=device)
-        ip[0, 0] = sorted_inp
-        ip[0, 1] = out_ids
-        ipn = torch.tensor([nhot], dtype=torch.int32, device=device)
-
-        ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = implicit_gemm_forward(features, filters, ip, ipn, n_out)
-        assert out is not None
-
-        torch.cuda.synchronize()
-        torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":
