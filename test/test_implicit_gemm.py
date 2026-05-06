@@ -131,7 +131,7 @@ class TestImplicitGemmGPU:
             atol, rtol = 1e-3, 1e-3
         else:
             atol, rtol = 0.05, 0.05
-        torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
 
     def test_basic_f32(self):
         self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float32)
