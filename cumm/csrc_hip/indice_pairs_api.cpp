@@ -17,6 +17,7 @@ void build_implicit_gemm_mask_gpu(
     int kv, int N, int num_act_out, int block_m,
     int* sorted_inp, int* sorted_out, int* sorted_kv,
     int* mask, int* pair_start, int* pair_end,
+    int* inp_row_lut,
     int total_pairs, int num_tiles,
     hipStream_t stream);
 
@@ -102,7 +103,8 @@ std::vector<torch::Tensor> build_implicit_gemm_mask(
         auto mask = torch::zeros({num_tiles, kv}, options);
         auto ps = torch::full({num_tiles, kv}, 0x7FFFFFFF, options);
         auto pe = torch::zeros({num_tiles, kv}, options);
-        return {empty, empty, empty, mask, ps, pe};
+        auto lut = torch::full({num_tiles, kv, (int)block_m}, -1, options);
+        return {empty, empty, empty, mask, ps, pe, lut};
     }
 
     auto sorted_inp = torch::empty({total_pairs}, options);
@@ -111,6 +113,7 @@ std::vector<torch::Tensor> build_implicit_gemm_mask(
     auto mask = torch::zeros({num_tiles, kv}, options);
     auto pair_start = torch::full({num_tiles, kv}, 0x7FFFFFFF, options);
     auto pair_end = torch::zeros({num_tiles, kv}, options);
+    auto inp_row_lut = torch::full({num_tiles, kv, (int)block_m}, -1, options);
 
     hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
 
@@ -124,10 +127,11 @@ std::vector<torch::Tensor> build_implicit_gemm_mask(
         mask.data_ptr<int>(),
         pair_start.data_ptr<int>(),
         pair_end.data_ptr<int>(),
+        inp_row_lut.data_ptr<int>(),
         total_pairs, num_tiles,
         stream);
 
-    return {sorted_inp, sorted_out, sorted_kv, mask, pair_start, pair_end};
+    return {sorted_inp, sorted_out, sorted_kv, mask, pair_start, pair_end, inp_row_lut};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

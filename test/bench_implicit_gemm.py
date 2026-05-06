@@ -81,7 +81,7 @@ def bench_fn(fn, warmup=10, repeats=50, label=""):
 
 
 def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
-    from cumm.implicit_gemm import implicit_gemm_forward, _get_hip_module
+    from cumm.implicit_gemm import implicit_gemm_forward, implicit_gemm_v4_forward, _get_hip_module
 
     features = torch.randn(n_active, c_in, dtype=dtype, device=device) * 0.1
     filters = torch.randn(kv, c_in, c_out, dtype=dtype, device=device) * 0.1
@@ -93,59 +93,62 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
           f"density={density:.1%}, total_pairs={total_pairs}, dtype={dtype}")
     print(f"{'='*75}")
 
-    # Correctness check
     ref = reference_indice_conv(features, filters, ip, ipn, n_active)
-    impl = implicit_gemm_forward(features, filters, ip, ipn, n_active)
-    if impl is not None:
-        torch.cuda.synchronize()
-        max_err = (impl.float() - ref.float()).abs().max().item()
-        print(f"  Max error (implicit vs reference): {max_err:.6f}")
-    else:
-        print(f"  [WARN] Implicit GEMM failed, skipping")
-        return
 
     # [A] Python for-loop baseline
     bench_fn(lambda: reference_indice_conv(features, filters, ip, ipn, n_active),
              label="[A] Python for-loop (gather+mm+scatter)")
 
-    # [B] Full implicit GEMM pipeline (mask gen + kernel)
-    bench_fn(lambda: implicit_gemm_forward(features, filters, ip, ipn, n_active),
-             label="[B] Implicit GEMM V2 (full: mask + kernel)")
+    # [B] V3 implicit GEMM
+    impl_v3 = implicit_gemm_forward(features, filters, ip, ipn, n_active)
+    if impl_v3 is not None:
+        torch.cuda.synchronize()
+        max_err = (impl_v3.float() - ref.float()).abs().max().item()
+        print(f"  V3 max error: {max_err:.6f}")
+        bench_fn(lambda: implicit_gemm_forward(features, filters, ip, ipn, n_active),
+                 label="[B] Implicit GEMM V3 (full)")
 
-    # [B.2] Mask generation only
+    # [C] V4 implicit GEMM (lut-based)
+    impl_v4 = implicit_gemm_v4_forward(features, filters, ip, ipn, n_active)
+    if impl_v4 is not None:
+        torch.cuda.synchronize()
+        max_err = (impl_v4.float() - ref.float()).abs().max().item()
+        print(f"  V4 max error: {max_err:.6f}")
+        bench_fn(lambda: implicit_gemm_v4_forward(features, filters, ip, ipn, n_active),
+                 label="[C] Implicit GEMM V4 (full: mask+lut + kernel)")
+
+        # [C.2] V4 kernel only
+        from cumm.implicit_gemm import _V4_COMPILED_KERNELS, _get_hip_module
+        hip = _get_hip_module()
+        dtype_str = 'f32' if dtype == torch.float32 else ('f16' if dtype == torch.float16 else 'bf16')
+        v4_key = ('v4', c_in, c_out, kv, dtype_str)
+        if v4_key in _V4_COMPILED_KERNELS and hip is not None:
+            launch_fn, block_m = _V4_COMPILED_KERNELS[v4_key]
+            num_tiles = (n_active + block_m - 1) // block_m
+            _, _, _, mask, _, _, lut = hip.build_implicit_gemm_mask(ip, ipn, n_active, block_m)
+            weights_flat = filters.reshape(-1).contiguous()
+            features_c = features.contiguous()
+            mask_flat = mask.reshape(-1).contiguous()
+            lut_flat = lut.reshape(-1).contiguous()
+
+            def v4_kernel_only():
+                out_features = torch.zeros(n_active, c_out, dtype=torch.float32, device=device)
+                stream = torch.cuda.current_stream()
+                launch_fn(features_c, weights_flat, out_features,
+                          lut_flat, mask_flat,
+                          num_tiles, n_active, stream)
+                return out_features
+
+            bench_fn(v4_kernel_only, label="[C.3] V4 Kernel only (no mask gen)")
+    else:
+        print(f"  [WARN] V4 Implicit GEMM failed, skipping")
+
+    # Mask generation only
     hip = _get_hip_module()
     if hip is not None:
         BLOCK_M = 64
         bench_fn(lambda: hip.build_implicit_gemm_mask(ip, ipn, n_active, BLOCK_M),
-                 label="[B.2] Mask generation only (C++/HIP sort+mask)")
-
-    # [B.3] Kernel only (pre-computed mask)
-    from cumm.implicit_gemm import _COMPILED_KERNELS
-    dtype_str = 'f32' if dtype == torch.float32 else ('f16' if dtype == torch.float16 else 'bf16')
-    key = (c_in, c_out, kv, dtype_str)
-    if key in _COMPILED_KERNELS and hip is not None:
-        launch_fn, block_m = _COMPILED_KERNELS[key]
-        num_tiles = (n_active + block_m - 1) // block_m
-
-        # Pre-compute mask
-        sorted_inp, sorted_out, sorted_kv, mask, pair_start, pair_end = \
-            hip.build_implicit_gemm_mask(ip, ipn, n_active, block_m)
-        weights_flat = filters.reshape(-1).contiguous()
-        features_c = features.contiguous()
-        mask_flat = mask.reshape(-1).contiguous()
-        ps_flat = pair_start.reshape(-1).contiguous()
-        pe_flat = pair_end.reshape(-1).contiguous()
-
-        def kernel_only():
-            out_features = torch.zeros(n_active, c_out, dtype=torch.float32, device=device)
-            stream = torch.cuda.current_stream()
-            launch_fn(features_c, weights_flat, out_features,
-                      sorted_inp, sorted_out,
-                      mask_flat, ps_flat, pe_flat,
-                      num_tiles, n_active, stream)
-            return out_features
-
-        bench_fn(kernel_only, label="[B.3] Kernel only (no mask gen)")
+                 label="[D] Mask+LUT generation only (C++/HIP)")
 
 
 def main():

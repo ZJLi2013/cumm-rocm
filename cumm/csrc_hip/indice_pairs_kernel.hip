@@ -240,8 +240,29 @@ __global__ void build_mask_kernel(
     }
 }
 
+// Build inp_row_lut: for each (tile, kv, local_row), store the input row index.
+// sorted pairs are ordered by (kv, out_index). For SubM conv each (out_row, kv)
+// has at most 1 pair, so we can directly scatter into lut.
+__global__ void build_lut_kernel(
+    const int* __restrict__ sorted_inp,   // [total_pairs]
+    const int* __restrict__ sorted_out,   // [total_pairs]
+    const int* __restrict__ sorted_kv,    // [total_pairs]
+    int* __restrict__ inp_row_lut,        // [num_tiles * kv * block_m], init to -1
+    int total_pairs, int num_tiles, int kv, int block_m)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < total_pairs; i += gridDim.x * blockDim.x) {
+        int out_idx = sorted_out[i];
+        int k = sorted_kv[i];
+        int tile = out_idx / block_m;
+        int local_row = out_idx % block_m;
+        if (tile >= num_tiles) continue;
+        inp_row_lut[tile * kv * block_m + k * block_m + local_row] = sorted_inp[i];
+    }
+}
+
 // Host function: takes indice_pairs + indice_pair_num (outputs of get_indice_pairs),
-// produces sorted pair arrays + mask + pair ranges for the implicit GEMM kernel.
+// produces sorted pair arrays + mask + pair ranges + inp_row_lut for the implicit GEMM kernel.
 void build_implicit_gemm_mask_gpu(
     const int* indice_pairs,
     const int* indice_pair_num,
@@ -249,6 +270,7 @@ void build_implicit_gemm_mask_gpu(
     // Outputs (caller allocates):
     int* sorted_inp, int* sorted_out, int* sorted_kv,
     int* mask, int* pair_start, int* pair_end,
+    int* inp_row_lut,
     int total_pairs, int num_tiles,
     hipStream_t stream)
 {
@@ -331,6 +353,14 @@ void build_implicit_gemm_mask_gpu(
         dim3(blocks_mask), dim3(threads), 0, stream,
         sorted_out, sorted_kv,
         mask, pair_start, pair_end,
+        total_pairs, num_tiles, kv, block_m);
+
+    // 6. Build inp_row_lut
+    hipMemsetAsync(inp_row_lut, 0xFF, num_tiles * kv * block_m * sizeof(int), stream);  // -1
+    hipLaunchKernelGGL(build_lut_kernel,
+        dim3(blocks_mask), dim3(threads), 0, stream,
+        sorted_inp, sorted_out, sorted_kv,
+        inp_row_lut,
         total_pairs, num_tiles, kv, block_m);
 
     // Cleanup temporaries

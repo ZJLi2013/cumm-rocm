@@ -119,7 +119,7 @@ class TestMaskGeneration:
         ipn[2] = 0
 
         results = hip.build_implicit_gemm_mask(ip, ipn, n_out, block_m)
-        sorted_inp, sorted_out, sorted_kv, mask, pair_start, pair_end = results
+        sorted_inp, sorted_out, sorted_kv, mask, pair_start, pair_end, lut = results
 
         mask_cpu = mask.cpu()
         assert mask_cpu.shape == (2, 3)  # 2 tiles, 3 kv
@@ -144,7 +144,7 @@ class TestMaskGeneration:
         ip[:, 1] = ip[:, 1] % n_out
 
         results = hip.build_implicit_gemm_mask(ip, ipn, n_out, block_m)
-        sorted_inp, sorted_out, sorted_kv, mask, ps, pe = results
+        sorted_inp, sorted_out, sorted_kv, mask, ps, pe, lut = results
 
         kv_cpu = sorted_kv.cpu().numpy()
         out_cpu = sorted_out.cpu().numpy()
@@ -178,7 +178,7 @@ class TestMaskGeneration:
         ipn[1] = 15
 
         results = hip.build_implicit_gemm_mask(ip, ipn, n_out, block_m)
-        _, sorted_out, sorted_kv, mask, ps, pe = results
+        _, sorted_out, sorted_kv, mask, ps, pe, _ = results
 
         mask_cpu = mask.cpu()
         ps_cpu = ps.cpu()
@@ -304,6 +304,127 @@ class TestMemoryLayout:
             for j in range(c_out):
                 lds_idx = c * c_out + j
                 assert lds_idx == c * c_out + j, "Weight LDS layout mismatch"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+class TestInpRowLut:
+    """Test inp_row_lut correctness."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_no_hip(self):
+        from cumm.implicit_gemm import _get_hip_module
+        if _get_hip_module() is None:
+            pytest.skip("HIP module not available")
+
+    def test_lut_basic(self):
+        """Each (tile, kv, local_row) should map to the correct input row."""
+        from cumm.implicit_gemm import _get_hip_module
+        hip = _get_hip_module()
+
+        device = "cuda"
+        n_out, kv, block_m = 128, 2, 64
+
+        ip = torch.full((kv, 2, 50), -1, dtype=torch.int32, device=device)
+        ipn = torch.zeros(kv, dtype=torch.int32, device=device)
+
+        # kv=0: pairs mapping out 0..19 → inp 100..119
+        for i in range(20):
+            ip[0, 0, i] = 100 + i   # inp
+            ip[0, 1, i] = i         # out
+        ipn[0] = 20
+
+        # kv=1: pairs mapping out 64..73 → inp 200..209
+        for i in range(10):
+            ip[1, 0, i] = 200 + i
+            ip[1, 1, i] = 64 + i
+        ipn[1] = 10
+
+        results = hip.build_implicit_gemm_mask(ip, ipn, n_out, block_m)
+        lut = results[6]  # inp_row_lut [num_tiles, kv, block_m]
+        lut_cpu = lut.cpu()
+
+        # tile 0, kv 0: local rows 0..19 should have inp 100..119
+        for i in range(20):
+            assert lut_cpu[0, 0, i].item() == 100 + i, \
+                f"lut[0,0,{i}] = {lut_cpu[0,0,i].item()}, expected {100+i}"
+        # tile 0, kv 0: rows 20..63 should be -1
+        for i in range(20, 64):
+            assert lut_cpu[0, 0, i].item() == -1
+
+        # tile 1, kv 1: local rows 0..9 should have inp 200..209
+        for i in range(10):
+            assert lut_cpu[1, 1, i].item() == 200 + i
+
+        # tile 0, kv 1: all -1
+        assert (lut_cpu[0, 1] == -1).all()
+
+    def test_lut_shape(self):
+        from cumm.implicit_gemm import _get_hip_module
+        hip = _get_hip_module()
+
+        device = "cuda"
+        ip, ipn = _make_pairs(3, [30, 50, 20], n_max=50, device=device)
+        ip[ip < 0] = 0
+        ip[:, 0] = ip[:, 0] % 200
+        ip[:, 1] = ip[:, 1] % 200
+
+        results = hip.build_implicit_gemm_mask(ip, ipn, 200, 64)
+        lut = results[6]
+        num_tiles = (200 + 63) // 64
+        assert lut.shape == (num_tiles, 3, 64)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+class TestImplicitGemmV4:
+    """GPU tests for V4 implicit GEMM kernel (lut-based gather + register blocking)."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_no_flydsl(self):
+        try:
+            import flydsl
+        except ImportError:
+            pytest.skip("FlyDSL not installed")
+
+    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, dtype):
+        from cumm.implicit_gemm import implicit_gemm_v4_forward
+
+        device = "cuda"
+        features = torch.randn(n_in, c_in, dtype=dtype, device=device) * 0.1
+        filters = torch.randn(kv, c_in, c_out, dtype=dtype, device=device) * 0.1
+        ip, ipn = _make_pairs(kv, nhot_list, n_max=max(nhot_list), device=device)
+        ip[ip < 0] = 0
+        ip[:, 0] = ip[:, 0] % n_in
+        ip[:, 1] = ip[:, 1] % n_out
+
+        ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
+        out = implicit_gemm_v4_forward(features, filters, ip, ipn, n_out)
+        assert out is not None, "V4 kernel compilation failed"
+
+        torch.cuda.synchronize()
+        if dtype == torch.float32:
+            atol, rtol = 1e-3, 1e-3
+        else:
+            atol, rtol = 0.05, 0.05
+        torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
+
+    def test_basic_f32(self):
+        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float32)
+
+    def test_basic_f16(self):
+        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float16)
+
+    def test_single_kv(self):
+        self._run_correctness(200, 200, 32, 64, 1, [150], torch.float32)
+
+    def test_some_empty_kv(self):
+        self._run_correctness(100, 100, 16, 16, 5, [30, 0, 50, 0, 20], torch.float32)
+
+    def test_partial_tile(self):
+        self._run_correctness(50, 50, 16, 16, 1, [7], torch.float32)
+
+    def test_kv27_subm(self):
+        """Typical 3x3x3 SubM config."""
+        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, torch.float32)
 
 
 if __name__ == "__main__":
