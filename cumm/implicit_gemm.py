@@ -26,33 +26,12 @@ _COMPILED_KERNELS: Dict = {}
 
 
 def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
-    """Compile FlyDSL fused gather+GEMM+scatter kernel.
-
-    Thread mapping:
-      BLOCK_M threads per workgroup, each thread handles one (inp, out) pair.
-      Workgroups are tiled over kv positions and pair ranges.
-
-    Weight loading:
-      Cooperative: all BLOCK_M threads load weight[k_pos, :, :] into LDS.
-      Weight is row-major in LDS: w_lds[c * C_OUT + j] for coalesced reads
-      in the inner j loop.
-
-    Feature loading (indirect):
-      Each thread loads features[inp_indices[global_pair_idx], c] — indirect access.
-      Because pairs are sorted by inp_indices in preprocessing, neighboring threads
-      access nearby feature rows → quasi-coalesced.
-
-    Output scatter (atomic):
-      Each thread atomically adds its result to output[out_indices[pair], j].
-      We always accumulate in f32 and use f32 atomicAdd for simplicity.
-    """
+    """Compile FlyDSL fused gather+GEMM+scatter kernel."""
     import sys
     import os
-    # FlyDSL's kernels/ lives under the FlyDSL install root (e.g. /opt/FlyDSL)
     _flydsl_root = os.path.dirname(os.path.dirname(__import__('flydsl').__file__))
     if _flydsl_root not in sys.path:
         sys.path.insert(0, _flydsl_root)
-    # Also check /opt/FlyDSL (common Docker location)
     if '/opt/FlyDSL' not in sys.path and os.path.isdir('/opt/FlyDSL'):
         sys.path.insert(0, '/opt/FlyDSL')
 
@@ -72,46 +51,45 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
     C_OUT = c_out
     BLOCK_M = 64
     W_ELEMS = C_IN * C_OUT
-
-    # Output always in f32 for atomic correctness
     OUT_DT_BYTES = 4
 
     if dtype_str == 'f32':
-        dt = T.f32
         DT_BYTES = 4
-    elif dtype_str == 'f16':
-        dt = T.f16
-        DT_BYTES = 2
-    elif dtype_str == 'bf16':
-        dt = T.bf16
+    elif dtype_str in ('f16', 'bf16'):
         DT_BYTES = 2
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
-    # LDS for weight tile (manual offset management, matching hgemm_splitk pattern)
+    # LDS allocation — pure Python math, no MLIR ops
     allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig")
     smem_w_offset = allocator._align(allocator.ptr, 16)
     W_BYTES = W_ELEMS * DT_BYTES
     allocator.ptr = smem_w_offset + W_BYTES
 
-    # How many iterations each thread does to cooperatively load weight to LDS
     LOAD_ITERS = math.ceil(W_ELEMS / BLOCK_M)
 
     @flyc.kernel(known_block_size=[BLOCK_M, 1, 1])
     def implicit_gemm_kernel(
-        features: fx.Tensor,        # [N_in, C_in], dt
-        weights: fx.Tensor,         # [kv * C_in * C_out], dt (flattened)
-        output: fx.Tensor,          # [N_out, C_out], f32
-        inp_indices: fx.Tensor,     # [total_padded_pairs], i32
-        out_indices: fx.Tensor,     # [total_padded_pairs], i32
-        tile_kpos: fx.Tensor,       # [num_tiles], i32
-        tile_pair_count: fx.Tensor, # [num_tiles], i32
+        features: fx.Tensor,
+        weights: fx.Tensor,
+        output: fx.Tensor,
+        inp_indices: fx.Tensor,
+        out_indices: fx.Tensor,
+        tile_kpos: fx.Tensor,
+        tile_pair_count: fx.Tensor,
         total_pairs_val: fx.Int32,
     ):
+        # Resolve MLIR types INSIDE kernel (context is active here)
+        if const_expr(dtype_str == 'f32'):
+            dt = T.f32
+        elif const_expr(dtype_str == 'f16'):
+            dt = T.f16
+        else:
+            dt = T.bf16
+
         tid = fx.Int32(gpu.thread_idx.x)
         bid = fx.Int32(gpu.block_idx.x)
 
-        # Wrap tensors
         feat_ = GTensor(features, dtype=dt, shape=(-1,))
         w_ = GTensor(weights, dtype=dt, shape=(-1,))
         out_ = GTensor(output, dtype=T.f32, shape=(-1,))
@@ -120,11 +98,10 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
         kpos_ = GTensor(tile_kpos, dtype=T.i32, shape=(-1,))
         tpc_ = GTensor(tile_pair_count, dtype=T.i32, shape=(-1,))
 
-        # Read tile metadata
         k_pos = kpos_.load(fx.Index(bid))
         n_valid = tpc_.load(fx.Index(bid))
 
-        # LDS for weight: SmemPtr → STensor (matches hgemm_splitk pattern)
+        # LDS setup
         base_ptr = allocator.get_base()
         smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, dt, shape=(W_ELEMS,))
         w_lds = STensor(smem_w_ptr, dt, shape=(W_ELEMS,))
@@ -148,20 +125,18 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
         with ir.InsertionPoint(active_if.then_block):
             global_pair_idx = fx.Index(bid) * fx.Index(const_expr(BLOCK_M)) + fx.Index(tid)
 
-            # Indirect index lookups
             inp_row = inp_idx_.load(global_pair_idx)
             out_row = out_idx_.load(global_pair_idx)
 
             feat_row_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
             out_row_base = fx.Index(out_row) * fx.Index(const_expr(C_OUT))
 
-            # Extract output base pointer once (hoisted from inner loop)
+            # Output base pointer (hoisted)
             _ptr_type = ir.Type.parse("!llvm.ptr<1>")
             out_raw = fly_values(output)[0]
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
             out_base_int = llvm.PtrToIntOp(T.i64, out_base_ptr).result
 
-            # Compute output[out_row, j] += sum_c(features[inp_row, c] * weight[c, j])
             for j in range_constexpr(C_OUT):
                 acc = arith.constant(0.0, type=T.f32)
 
@@ -183,7 +158,7 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
                     acc = arith.FMAOp(f_f32, w_f32, acc,
                                       fastmath=arith.FastMathFlags.fast)
 
-                # Atomic f32 add to output
+                # Atomic f32 scatter
                 out_elem_off = out_row_base + fx.Index(const_expr(j))
                 byte_off = arith.index_cast(T.i64, out_elem_off * fx.Index(const_expr(OUT_DT_BYTES)))
                 addr_i64 = llvm.AddOp(out_base_int, byte_off, llvm.IntegerOverflowFlags(0)).result
@@ -231,19 +206,11 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
 
 
 def preprocess_pairs(
-    indice_pairs: torch.Tensor,     # [kv, 2, N_max]
-    indice_pair_num: torch.Tensor,  # [kv]
+    indice_pairs: torch.Tensor,
+    indice_pair_num: torch.Tensor,
     block_m: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Sort pairs within each kv group by inp_indices for coalesced access.
-
-    Returns:
-        inp_indices_flat: [num_tiles * block_m] int32, padded
-        out_indices_flat: [num_tiles * block_m] int32, padded
-        tile_kpos: [num_tiles] int32
-        tile_pair_count: [num_tiles] int32
-        num_tiles: int
-    """
+    """Sort pairs within each kv group by inp_indices for coalesced access."""
     kv = indice_pairs.shape[0]
     device = indice_pairs.device
     pair_num_cpu = indice_pair_num.cpu().int().numpy()
@@ -296,16 +263,13 @@ def preprocess_pairs(
 
 
 def implicit_gemm_forward(
-    features: torch.Tensor,         # [N_in, C_in]
-    filters: torch.Tensor,          # [kv, C_in, C_out]
-    indice_pairs: torch.Tensor,     # [kv, 2, N_max]
-    indice_pair_num: torch.Tensor,  # [kv]
+    features: torch.Tensor,
+    filters: torch.Tensor,
+    indice_pairs: torch.Tensor,
+    indice_pair_num: torch.Tensor,
     num_activate_out: int,
 ) -> Optional[torch.Tensor]:
-    """Fused gather+GEMM+scatter via FlyDSL implicit GEMM.
-
-    Returns output tensor, or None if FlyDSL is not available.
-    """
+    """Fused gather+GEMM+scatter via FlyDSL implicit GEMM."""
     try:
         import flydsl
     except ImportError:
@@ -346,13 +310,10 @@ def implicit_gemm_forward(
     if num_tiles == 0:
         return torch.zeros(num_activate_out, c_out, dtype=torch.float32, device=device)
 
-    # Output always f32 for atomic correctness
     out_features = torch.zeros(num_activate_out, c_out, dtype=torch.float32, device=device)
     total_pairs = inp_flat.shape[0]
 
     stream = torch.cuda.current_stream()
-
-    # Flatten weights for contiguous access
     weights_flat = filters.reshape(-1).contiguous()
 
     launch_fn(
@@ -365,7 +326,6 @@ def implicit_gemm_forward(
         stream,
     )
 
-    # Cast back to input dtype if needed
     if dtype != torch.float32:
         out_features = out_features.to(dtype)
 
