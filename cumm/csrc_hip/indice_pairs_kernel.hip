@@ -158,10 +158,10 @@ void generate_subm_conv_inds(
 // Mask generation for output-tile-centric implicit GEMM
 // ============================================================================
 
-// Flatten indice_pairs[2, kv, N] → contiguous (inp, out, kv_id) arrays.
+// Flatten indice_pairs[kv, 2, N] → contiguous (inp, out, kv_id) arrays.
 // Also produces composite sort key = kv_id * stride + out_index.
 __global__ void flatten_pairs_kernel(
-    const int* __restrict__ indice_pairs,  // [2, kv, N]
+    const int* __restrict__ indice_pairs,  // [kv, 2, N] — layout: [k][0=inp/1=out][p]
     const int* __restrict__ cum_offsets,    // [kv+1] cumulative pair counts
     const int* __restrict__ pair_num,       // [kv]
     int N,                                 // max pairs per kv (indices_pair_size)
@@ -173,10 +173,10 @@ __global__ void flatten_pairs_kernel(
     int64_t* __restrict__ sort_keys,       // [total_pairs]
     int* __restrict__ sort_vals)            // [total_pairs] = original index
 {
-    int ips_mul_kv = N * kv;  // offset to out indices in indice_pairs
+    int total_slots = N * kv;
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < ips_mul_kv;  // iterate over all (kv, pair_within_kv) slots
+         i < total_slots;
          i += gridDim.x * blockDim.x) {
         int k = i / N;
         int p = i % N;
@@ -184,8 +184,9 @@ __global__ void flatten_pairs_kernel(
         if (p >= nhot) continue;
 
         int dst = cum_offsets[k] + p;
-        int inp_val = indice_pairs[k * N + p];
-        int out_val = indice_pairs[ips_mul_kv + k * N + p];
+        // [kv, 2, N] layout: inp at k*2*N + 0*N + p, out at k*2*N + 1*N + p
+        int inp_val = indice_pairs[k * 2 * N + p];
+        int out_val = indice_pairs[k * 2 * N + N + p];
         flat_inp[dst] = inp_val;
         flat_out[dst] = out_val;
         flat_kv[dst] = k;

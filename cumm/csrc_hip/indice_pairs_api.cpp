@@ -70,7 +70,7 @@ std::vector<torch::Tensor> get_indice_pairs_subm(
 }
 
 // Build mask for output-tile-centric implicit GEMM.
-// Input: indice_pairs [2, kv, N], indice_pair_num [kv], num_act_out, block_m
+// Input: indice_pairs [kv, 2, N], indice_pair_num [kv], num_act_out, block_m
 // Returns: (sorted_inp, sorted_out, sorted_kv, mask, pair_start, pair_end)
 //   sorted_inp/out/kv: [total_pairs] sorted by (kv, out_index)
 //   mask:       [num_tiles, kv]  — 1 if active
@@ -83,9 +83,9 @@ std::vector<torch::Tensor> build_implicit_gemm_mask(
     int64_t block_m)
 {
     TORCH_CHECK(indice_pairs.is_cuda(), "indice_pairs must be on GPU");
-    TORCH_CHECK(indice_pairs.dim() == 3, "indice_pairs must be [2, kv, N]");
+    TORCH_CHECK(indice_pairs.dim() == 3, "indice_pairs must be [kv, 2, N]");
 
-    int kv = indice_pairs.size(1);
+    int kv = indice_pairs.size(0);
     int N = indice_pairs.size(2);
     int num_tiles = ((int)num_act_out + (int)block_m - 1) / (int)block_m;
 
