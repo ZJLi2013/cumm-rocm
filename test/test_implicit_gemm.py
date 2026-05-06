@@ -394,7 +394,13 @@ class TestImplicitGemmV4:
         ip, ipn = _make_pairs(kv, nhot_list, n_max=max(nhot_list), device=device)
         ip[ip < 0] = 0
         ip[:, 0] = ip[:, 0] % n_in
-        ip[:, 1] = ip[:, 1] % n_out
+        # V4 lut assumes SubM: unique output index per (kv, out_row).
+        # Use unique permutation to avoid duplicates.
+        for k_idx in range(kv):
+            nhot = nhot_list[k_idx]
+            if nhot > 0:
+                perm = torch.randperm(n_out, device=device, dtype=torch.int32)[:nhot]
+                ip[k_idx, 1, :nhot] = perm
 
         ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
         out = implicit_gemm_v4_forward(features, filters, ip, ipn, n_out)
