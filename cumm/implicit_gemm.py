@@ -68,41 +68,26 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
 
     LOAD_ITERS = math.ceil(W_ELEMS / BLOCK_M)
 
-    IS_F32 = (dtype_str == 'f32')
-
-    def _make_kernel():
-        """Factory to avoid closure free-var count issues with FlyDSL AST rewriter."""
-
+    def _make_kernel_f32():
         @flyc.kernel(known_block_size=[BLOCK_M, 1, 1])
-        def implicit_gemm_kernel(
-            features: fx.Tensor,
-            weights: fx.Tensor,
-            output: fx.Tensor,
-            inp_indices: fx.Tensor,
-            out_indices: fx.Tensor,
-            tile_kpos: fx.Tensor,
-            tile_pair_count: fx.Tensor,
-            total_pairs_val: fx.Int32,
-        ):
-            dt = T.f32 if const_expr(IS_F32) else (T.f16 if const_expr(dtype_str == 'f16') else T.bf16)
-
+        def kernel(features: fx.Tensor, weights: fx.Tensor, output: fx.Tensor,
+                   inp_indices: fx.Tensor, out_indices: fx.Tensor,
+                   tile_kpos: fx.Tensor, tile_pair_count: fx.Tensor,
+                   total_pairs_val: fx.Int32):
+            dt = T.f32
             tid = fx.Int32(gpu.thread_idx.x)
             bid = fx.Int32(gpu.block_idx.x)
-
             feat_ = GTensor(features, dtype=dt, shape=(-1,))
             w_ = GTensor(weights, dtype=dt, shape=(-1,))
             inp_idx_ = GTensor(inp_indices, dtype=T.i32, shape=(-1,))
             out_idx_ = GTensor(out_indices, dtype=T.i32, shape=(-1,))
             kpos_ = GTensor(tile_kpos, dtype=T.i32, shape=(-1,))
             tpc_ = GTensor(tile_pair_count, dtype=T.i32, shape=(-1,))
-
             k_pos = kpos_.load(fx.Index(bid))
             n_valid = tpc_.load(fx.Index(bid))
-
             base_ptr = allocator.get_base()
             smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, dt, shape=(W_ELEMS,))
             w_lds = STensor(smem_w_ptr, dt, shape=(W_ELEMS,))
-
             w_base_offset = fx.Index(k_pos) * fx.Index(const_expr(W_ELEMS))
             for wi in range_constexpr(LOAD_ITERS):
                 w_idx = fx.Index(const_expr(wi * BLOCK_M)) + fx.Index(tid)
@@ -112,57 +97,107 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
                     w_val = w_.load(w_base_offset + w_idx)
                     w_lds[w_idx] = w_val
                     scf.YieldOp([])
-
             gpu.barrier()
-
             is_active = arith.cmpi(arith.CmpIPredicate.slt, fx.Int32(tid), n_valid)
             active_if = scf.IfOp(is_active, results_=[], has_else=False)
             with ir.InsertionPoint(active_if.then_block):
                 global_pair_idx = fx.Index(bid) * fx.Index(const_expr(BLOCK_M)) + fx.Index(tid)
                 inp_row = inp_idx_.load(global_pair_idx)
                 out_row = out_idx_.load(global_pair_idx)
-
                 feat_row_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
                 out_row_base = fx.Index(out_row) * fx.Index(const_expr(C_OUT))
-
                 _ptr_type = ir.Type.parse("!llvm.ptr<1>")
                 out_raw = fly_values(output)[0]
                 out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
                 out_base_int = llvm.PtrToIntOp(T.i64, out_base_ptr).result
-
                 for j in range_constexpr(C_OUT):
                     acc = arith.constant(0.0, type=T.f32)
-
                     for c in range_constexpr(C_IN):
                         f_off = feat_row_base + fx.Index(const_expr(c))
                         f_val = feat_.load(f_off)
-                        f_f32 = f_val if const_expr(IS_F32) else arith.ExtFOp(T.f32, f_val)
-
                         w_lds_idx = fx.Index(const_expr(c * C_OUT + j))
                         w_val = w_lds[w_lds_idx]
-                        w_f32 = w_val if const_expr(IS_F32) else arith.ExtFOp(T.f32, w_val)
-
-                        acc = arith.FMAOp(f_f32, w_f32, acc,
-                                          fastmath=arith.FastMathFlags.fast)
-
+                        acc = arith.FMAOp(f_val, w_val, acc, fastmath=arith.FastMathFlags.fast)
                     out_elem_off = out_row_base + fx.Index(const_expr(j))
                     byte_off = arith.index_cast(T.i64, out_elem_off * fx.Index(const_expr(OUT_DT_BYTES)))
                     addr_i64 = llvm.AddOp(out_base_int, byte_off, llvm.IntegerOverflowFlags(0)).result
                     addr_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
-
                     addr_v = addr_ptr._value if const_expr(hasattr(addr_ptr, "_value")) else addr_ptr
                     acc_v = acc._value if const_expr(hasattr(acc, "_value")) else acc
-                    llvm.AtomicRMWOp(
-                        llvm.AtomicBinOp.fadd,
-                        addr_v, acc_v,
-                        llvm.AtomicOrdering.monotonic,
-                        syncscope="agent", alignment=4)
-
+                    llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd, addr_v, acc_v,
+                                     llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4)
                 scf.YieldOp([])
+        return kernel
 
-        return implicit_gemm_kernel
+    def _make_kernel_fp16(use_f16=True):
+        @flyc.kernel(known_block_size=[BLOCK_M, 1, 1])
+        def kernel(features: fx.Tensor, weights: fx.Tensor, output: fx.Tensor,
+                   inp_indices: fx.Tensor, out_indices: fx.Tensor,
+                   tile_kpos: fx.Tensor, tile_pair_count: fx.Tensor,
+                   total_pairs_val: fx.Int32):
+            dt = T.f16 if const_expr(use_f16) else T.bf16
+            tid = fx.Int32(gpu.thread_idx.x)
+            bid = fx.Int32(gpu.block_idx.x)
+            feat_ = GTensor(features, dtype=dt, shape=(-1,))
+            w_ = GTensor(weights, dtype=dt, shape=(-1,))
+            inp_idx_ = GTensor(inp_indices, dtype=T.i32, shape=(-1,))
+            out_idx_ = GTensor(out_indices, dtype=T.i32, shape=(-1,))
+            kpos_ = GTensor(tile_kpos, dtype=T.i32, shape=(-1,))
+            tpc_ = GTensor(tile_pair_count, dtype=T.i32, shape=(-1,))
+            k_pos = kpos_.load(fx.Index(bid))
+            n_valid = tpc_.load(fx.Index(bid))
+            base_ptr = allocator.get_base()
+            smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, dt, shape=(W_ELEMS,))
+            w_lds = STensor(smem_w_ptr, dt, shape=(W_ELEMS,))
+            w_base_offset = fx.Index(k_pos) * fx.Index(const_expr(W_ELEMS))
+            for wi in range_constexpr(LOAD_ITERS):
+                w_idx = fx.Index(const_expr(wi * BLOCK_M)) + fx.Index(tid)
+                is_valid = arith.cmpi(arith.CmpIPredicate.ult, w_idx, fx.Index(const_expr(W_ELEMS)))
+                w_if = scf.IfOp(is_valid, results_=[], has_else=False)
+                with ir.InsertionPoint(w_if.then_block):
+                    w_val = w_.load(w_base_offset + w_idx)
+                    w_lds[w_idx] = w_val
+                    scf.YieldOp([])
+            gpu.barrier()
+            is_active = arith.cmpi(arith.CmpIPredicate.slt, fx.Int32(tid), n_valid)
+            active_if = scf.IfOp(is_active, results_=[], has_else=False)
+            with ir.InsertionPoint(active_if.then_block):
+                global_pair_idx = fx.Index(bid) * fx.Index(const_expr(BLOCK_M)) + fx.Index(tid)
+                inp_row = inp_idx_.load(global_pair_idx)
+                out_row = out_idx_.load(global_pair_idx)
+                feat_row_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
+                out_row_base = fx.Index(out_row) * fx.Index(const_expr(C_OUT))
+                _ptr_type = ir.Type.parse("!llvm.ptr<1>")
+                out_raw = fly_values(output)[0]
+                out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
+                out_base_int = llvm.PtrToIntOp(T.i64, out_base_ptr).result
+                for j in range_constexpr(C_OUT):
+                    acc = arith.constant(0.0, type=T.f32)
+                    for c in range_constexpr(C_IN):
+                        f_off = feat_row_base + fx.Index(const_expr(c))
+                        f_val = feat_.load(f_off)
+                        f_f32 = arith.ExtFOp(T.f32, f_val)
+                        w_lds_idx = fx.Index(const_expr(c * C_OUT + j))
+                        w_val = w_lds[w_lds_idx]
+                        w_f32 = arith.ExtFOp(T.f32, w_val)
+                        acc = arith.FMAOp(f_f32, w_f32, acc, fastmath=arith.FastMathFlags.fast)
+                    out_elem_off = out_row_base + fx.Index(const_expr(j))
+                    byte_off = arith.index_cast(T.i64, out_elem_off * fx.Index(const_expr(OUT_DT_BYTES)))
+                    addr_i64 = llvm.AddOp(out_base_int, byte_off, llvm.IntegerOverflowFlags(0)).result
+                    addr_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
+                    addr_v = addr_ptr._value if const_expr(hasattr(addr_ptr, "_value")) else addr_ptr
+                    acc_v = acc._value if const_expr(hasattr(acc, "_value")) else acc
+                    llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd, addr_v, acc_v,
+                                     llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4)
+                scf.YieldOp([])
+        return kernel
 
-    implicit_gemm_kernel = _make_kernel()
+    if dtype_str == 'f32':
+        implicit_gemm_kernel = _make_kernel_f32()
+    elif dtype_str == 'f16':
+        implicit_gemm_kernel = _make_kernel_fp16(use_f16=True)
+    else:
+        implicit_gemm_kernel = _make_kernel_fp16(use_f16=False)
 
     @flyc.jit
     def launch_fn(
