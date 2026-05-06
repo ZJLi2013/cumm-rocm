@@ -66,7 +66,7 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
 
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import gpu, arith, range_constexpr, const_expr, buffer_ops, rocdl
+    from flydsl.expr import gpu, arith, range_constexpr, const_expr, buffer_ops, rocdl, vector
     from flydsl.expr.typing import T
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import scf
@@ -188,15 +188,13 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
                                 feat_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
 
                                 for j in range_constexpr(C_OUT_VECS):
-                                    # Load current output accumulator from global
                                     out_off = out_row_base + fx.Index(const_expr(j * OUT_VEC))
                                     acc = out_.vec_load((out_off,), const_expr(OUT_VEC))
 
-                                    # Dot product: sum over C_IN
                                     for c in range_constexpr(C_IN):
                                         f_val = feat_.load(feat_base + fx.Index(const_expr(c)))
-                                    if const_expr(NEED_EXTF):
-                                        f_val = arith.extf(T.f32, f_val)
+                                        if const_expr(NEED_EXTF):
+                                            f_val = arith.extf(T.f32, f_val)
                                         f_bcast = vector.broadcast(
                                             T.vec(const_expr(OUT_VEC), T.f32), f_val)
 
@@ -216,7 +214,6 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
 
                                         acc = arith.addf(acc, arith.mulf(f_bcast, w_f32))
 
-                                    # Store back
                                     out_.vec_store((out_off,), acc, const_expr(OUT_VEC))
 
                                 scf.YieldOp([])
