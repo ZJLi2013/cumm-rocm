@@ -119,19 +119,12 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
         - Output buffer as accumulator (read-modify-write), avoids SSA threading
           through nested scf.IfOp/ForOp
         """
-        if is_f32:
-            kern_dt = T.f32
-        elif use_f16:
-            kern_dt = T.f16
-        else:
-            kern_dt = T.bf16
-
         @flyc.kernel(known_block_size=[BLOCK_M, 1, 1])
         def kernel(features: fx.Tensor, weights: fx.Tensor, output: fx.Tensor,
                    sorted_inp: fx.Tensor, sorted_out: fx.Tensor,
                    mask: fx.Tensor, pair_start: fx.Tensor, pair_end: fx.Tensor,
                    num_act_out_val: fx.Int32):
-            dt = kern_dt if const_expr(is_f32) else (T.f16 if const_expr(use_f16) else T.bf16)
+            dt = T.f32 if const_expr(is_f32) else (T.f16 if const_expr(use_f16) else T.bf16)
             tid = fx.Int32(gpu.thread_idx.x)
             bid = fx.Int32(gpu.block_idx.x)
 
