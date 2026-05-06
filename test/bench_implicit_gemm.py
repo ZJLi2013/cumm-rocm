@@ -81,7 +81,7 @@ def bench_fn(fn, warmup=10, repeats=50, label=""):
 
 
 def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
-    from cumm.implicit_gemm import implicit_gemm_forward, implicit_gemm_v4_forward, _get_hip_module
+    from cumm.implicit_gemm import implicit_gemm_forward, implicit_gemm_v4_forward, implicit_gemm_v5_forward, _get_hip_module
 
     features = torch.randn(n_active, c_in, dtype=dtype, device=device) * 0.1
     filters = torch.randn(kv, c_in, c_out, dtype=dtype, device=device) * 0.1
@@ -143,12 +143,45 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
     else:
         print(f"  [WARN] V4 Implicit GEMM failed, skipping")
 
+    # [E] V5 implicit GEMM (K-fused)
+    impl_v5 = implicit_gemm_v5_forward(features, filters, ip, ipn, n_active)
+    if impl_v5 is not None:
+        torch.cuda.synchronize()
+        max_err = (impl_v5.float() - ref.float()).abs().max().item()
+        print(f"  V5 max error: {max_err:.6f}")
+        bench_fn(lambda: implicit_gemm_v5_forward(features, filters, ip, ipn, n_active),
+                 label="[E] Implicit GEMM V5 (full: mask+lut + K-fused)")
+
+        from cumm.implicit_gemm import _V5_COMPILED_KERNELS
+        dtype_str = 'f32' if dtype == torch.float32 else ('f16' if dtype == torch.float16 else 'bf16')
+        v5_key = ('v5', c_in, c_out, kv, dtype_str)
+        if v5_key in _V5_COMPILED_KERNELS and hip is not None:
+            launch_fn, block_m = _V5_COMPILED_KERNELS[v5_key]
+            num_tiles = (n_active + block_m - 1) // block_m
+            _, _, _, mask, _, _, lut = hip.build_implicit_gemm_mask(ip, ipn, n_active, block_m)
+            weights_flat = filters.reshape(-1).contiguous()
+            features_c = features.contiguous()
+            mask_flat = mask.reshape(-1).contiguous()
+            lut_flat = lut.reshape(-1).contiguous()
+
+            def v5_kernel_only():
+                out_features = torch.zeros(n_active, c_out, dtype=torch.float32, device=device)
+                stream = torch.cuda.current_stream()
+                launch_fn(features_c, weights_flat, out_features,
+                          lut_flat, mask_flat,
+                          num_tiles, n_active, stream)
+                return out_features
+
+            bench_fn(v5_kernel_only, label="[E.3] V5 Kernel only (no mask gen)")
+    else:
+        print(f"  [WARN] V5 Implicit GEMM failed, skipping")
+
     # Mask generation only
     hip = _get_hip_module()
     if hip is not None:
         BLOCK_M = 64
         bench_fn(lambda: hip.build_implicit_gemm_mask(ip, ipn, n_active, BLOCK_M),
-                 label="[D] Mask+LUT generation only (C++/HIP)")
+                 label="[F] Mask+LUT generation only (C++/HIP)")
 
 
 def main():
