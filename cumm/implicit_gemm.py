@@ -74,6 +74,8 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
                    inp_indices: fx.Tensor, out_indices: fx.Tensor,
                    tile_kpos: fx.Tensor, tile_pair_count: fx.Tensor,
                    total_pairs_val: fx.Int32):
+            # keep range_constexpr alive after AST rewriter unrolls loops
+            _rc = range_constexpr
             dt = T.f32
             tid = fx.Int32(gpu.thread_idx.x)
             bid = fx.Int32(gpu.block_idx.x)
@@ -135,6 +137,7 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
                    inp_indices: fx.Tensor, out_indices: fx.Tensor,
                    tile_kpos: fx.Tensor, tile_pair_count: fx.Tensor,
                    total_pairs_val: fx.Int32):
+            _rc = range_constexpr
             dt = T.f16 if const_expr(use_f16) else T.bf16
             tid = fx.Int32(gpu.thread_idx.x)
             bid = fx.Int32(gpu.block_idx.x)
