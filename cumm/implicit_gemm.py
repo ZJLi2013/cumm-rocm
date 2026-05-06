@@ -46,6 +46,16 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
       Each thread atomically adds its result to output[out_indices[pair], j].
       We always accumulate in f32 and use f32 atomicAdd for simplicity.
     """
+    import sys
+    import os
+    # FlyDSL's kernels/ lives under the FlyDSL install root (e.g. /opt/FlyDSL)
+    _flydsl_root = os.path.dirname(os.path.dirname(__import__('flydsl').__file__))
+    if _flydsl_root not in sys.path:
+        sys.path.insert(0, _flydsl_root)
+    # Also check /opt/FlyDSL (common Docker location)
+    if '/opt/FlyDSL' not in sys.path and os.path.isdir('/opt/FlyDSL'):
+        sys.path.insert(0, '/opt/FlyDSL')
+
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr import gpu, arith, range_constexpr, const_expr, buffer_ops, rocdl
