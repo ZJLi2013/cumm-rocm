@@ -685,8 +685,8 @@ def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
             acc_base = fx.Index(tid) * fx.Index(const_expr(C_OUT))
 
             # Zero-init LDS accumulator (each thread zeroes its own C_OUT elements)
-            zero_vec = vector.splat(T.vec(const_expr(ACC_VEC), T.f32),
-                                    arith.constant(0.0, type=T.f32))
+            zero_scalar = arith.constant(0.0, type=T.f32)
+            zero_vec = vector.broadcast(T.vec(const_expr(ACC_VEC), T.f32), zero_scalar)
             for zi in range_constexpr(ACC_VEC_ITERS):
                 acc_lds.vec_store((acc_base + fx.Index(const_expr(zi * ACC_VEC)),),
                                  zero_vec, const_expr(ACC_VEC))
