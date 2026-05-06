@@ -161,31 +161,14 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
                     p_start = ps_.load(ps_idx)
                     p_end = pe_.load(ps_idx)
 
-                    # Search: find the pair where sorted_out == my_out_row
-                    # Since sorted by out_index, pairs for same out_row are contiguous.
-                    # Linear scan within [p_start, p_end) for matching out_row.
                     valid_thread = arith.cmpi(arith.CmpIPredicate.slt, my_out_row, num_act_out_val)
                     thread_if = scf.IfOp(valid_thread, results_=[], has_else=False)
                     with ir.InsertionPoint(thread_if.then_block):
-                        # Scan pairs for this (tile, kv) to find my input row
-                        # Multiple pairs may map to the same output row (from different inputs)
-                        n_pairs = arith.subi(p_end, p_start)
-                        # For SubM, typically 0 or 1 pair per (out_row, kv).
-                        # Iterate over all matching pairs and accumulate.
-                        for pi_offset in range(0):  # placeholder - need scf.for
-                            pass
-
-                        # Use scf.ForOp to iterate [p_start, p_end)
-                        # Check each pair: if sorted_out[pair] == my_out_row, accumulate
-                        # This is the key inner loop
-
-                        # Unfortunately, we can't use Python for-loop here since
-                        # p_start/p_end are runtime values. Use scf.ForOp.
                         p_start_idx = arith.index_cast(T.index, p_start)
                         p_end_idx = arith.index_cast(T.index, p_end)
-                        one_idx = fx.Index(const_expr(1))
+                        step_idx = arith.constant(1, type=T.index)
 
-                        loop = scf.ForOp(p_start_idx, p_end_idx, one_idx, iter_args=[])
+                        loop = scf.ForOp(p_start_idx, p_end_idx, step_idx, iter_args=[])
                         with ir.InsertionPoint(loop.body):
                             pi = loop.induction_variable
                             pair_out = sout_.load(pi)
@@ -203,11 +186,6 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
                                         w_lds_idx = fx.Index(const_expr(c * C_OUT + j))
                                         w_val = w_lds[w_lds_idx]
                                         acc = f_val * w_val + acc
-                                    # Accumulate to output (still need atomic since
-                                    # multiple kv contribute to same output row)
-                                    # Actually for output-tile-centric, we accumulate
-                                    # across kv AND across pairs. Use atomicAdd for now,
-                                    # but only within one thread's output row.
                                     out_off = out_row_base + fx.Index(const_expr(j))
                                     byte_off = arith.index_cast(T.i64, out_off * fx.Index(const_expr(OUT_DT_BYTES)))
                                     addr_i64 = llvm.AddOp(out_base_int, byte_off, llvm.IntegerOverflowFlags(0)).result
@@ -281,9 +259,9 @@ def _compile_implicit_gemm(c_in: int, c_out: int, kv: int, dtype_str: str):
                     with ir.InsertionPoint(thread_if.then_block):
                         p_start_idx = arith.index_cast(T.index, p_start)
                         p_end_idx = arith.index_cast(T.index, p_end)
-                        one_idx = fx.Index(const_expr(1))
+                        step_idx = arith.constant(1, type=T.index)
 
-                        loop = scf.ForOp(p_start_idx, p_end_idx, one_idx, iter_args=[])
+                        loop = scf.ForOp(p_start_idx, p_end_idx, step_idx, iter_args=[])
                         with ir.InsertionPoint(loop.body):
                             pi = loop.induction_variable
                             pair_out = sout_.load(pi)
