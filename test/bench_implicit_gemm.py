@@ -30,8 +30,8 @@ def make_subm_pairs(n_active, kv, density, device):
     for k in range(kv):
         nhot = nhot_per_kv[k]
         indice_pair_num[k] = nhot
-        inp = torch.randint(0, n_active, (nhot,), dtype=torch.int32, device=device)
-        out = torch.randint(0, n_active, (nhot,), dtype=torch.int32, device=device)
+        inp = torch.randperm(n_active, device=device, dtype=torch.int32)[:nhot]
+        out = torch.randperm(n_active, device=device, dtype=torch.int32)[:nhot]
         if k == kv // 2:
             out = inp.clone()
         indice_pairs[k, 0, :nhot] = inp
