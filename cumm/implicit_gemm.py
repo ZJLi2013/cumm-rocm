@@ -179,10 +179,10 @@ def _compile_implicit_gemm(c_in: int, c_out: int, dtype_str: str):
                     for c in range_constexpr(C_IN):
                         f_off = feat_row_base + fx.Index(const_expr(c))
                         f_val = feat_.load(f_off)
-                    f_f32 = arith.extf(T.f32, f_val)
-                    w_lds_idx = fx.Index(const_expr(c * C_OUT + j))
-                    w_val = w_lds[w_lds_idx]
-                    w_f32 = arith.extf(T.f32, w_val)
+                        f_f32 = arith.extf(T.f32, f_val)
+                        w_lds_idx = fx.Index(const_expr(c * C_OUT + j))
+                        w_val = w_lds[w_lds_idx]
+                        w_f32 = arith.extf(T.f32, w_val)
                         acc = f_f32 * w_f32 + acc
                     out_elem_off = out_row_base + fx.Index(const_expr(j))
                     byte_off = arith.index_cast(T.i64, out_elem_off * fx.Index(const_expr(OUT_DT_BYTES)))
