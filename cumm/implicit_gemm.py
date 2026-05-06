@@ -601,13 +601,12 @@ _V5_COMPILED_KERNELS: Dict = {}
 
 
 def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
-    """V5: K-fused implicit GEMM with LDS double-buffered weight.
+    """V5: True K-fused implicit GEMM.
 
-    Key difference from V4: instead of loading weight per-kv and doing
-    a short C_IN dot, we keep accumulation in registers across all kv
-    positions without writing back to global between kv iterations.
-    Weight LDS uses double buffering: prefetch next kv's weight while
-    computing with current kv's weight.
+    Accumulation stays in LDS across all kv positions (no per-kv global RMW).
+    LDS layout: weight[C_IN*C_OUT] + acc[BLOCK_M*C_OUT] (f32).
+    Single weight buffer (no double-buffer to save LDS for acc).
+    After all kv done, one global store from LDS acc.
     """
     import sys
     _flydsl_root = os.path.dirname(os.path.dirname(__import__('flydsl').__file__))
@@ -631,6 +630,7 @@ def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
     KV = kv
     BLOCK_M = 64
     W_ELEMS = C_IN * C_OUT
+    ACC_ELEMS = BLOCK_M * C_OUT
     OUT_VEC = min(4, C_OUT)
     C_OUT_VECS = C_OUT // OUT_VEC
 
@@ -642,15 +642,19 @@ def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
     W_BYTES = W_ELEMS * DT_BYTES
-    # Double buffer: two weight slots in LDS
+    ACC_BYTES = ACC_ELEMS * 4  # always f32
+
     allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig_v5")
-    smem_w0_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_w0_offset + W_BYTES
-    smem_w1_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_w1_offset + W_BYTES
+    smem_w_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = smem_w_offset + W_BYTES
+    smem_acc_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = smem_acc_offset + ACC_BYTES
 
     LDG_VEC = min(4, W_ELEMS)
     W_VEC_LOAD_PER_THREAD = math.ceil(W_ELEMS / (BLOCK_M * LDG_VEC))
+    # Each thread zeroes/stores C_OUT elements in acc LDS
+    ACC_VEC = min(4, C_OUT)
+    ACC_VEC_ITERS = C_OUT // ACC_VEC
 
     def _make_kernel_v5(is_f32=True, use_f16=True):
         NEED_EXTF = not is_f32
@@ -671,18 +675,24 @@ def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
             mask_ = GTensor(mask, dtype=T.i32, shape=(-1,))
 
             base_ptr = allocator.get_base()
-            smem_w0_ptr = SmemPtr(base_ptr, smem_w0_offset, dt, shape=(W_ELEMS,))
-            smem_w1_ptr = SmemPtr(base_ptr, smem_w1_offset, dt, shape=(W_ELEMS,))
-            w_lds_0 = STensor(smem_w0_ptr, dt, shape=(W_ELEMS,))
-            w_lds_1 = STensor(smem_w1_ptr, dt, shape=(W_ELEMS,))
+            smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, dt, shape=(W_ELEMS,))
+            w_lds = STensor(smem_w_ptr, dt, shape=(W_ELEMS,))
+            smem_acc_ptr = SmemPtr(base_ptr, smem_acc_offset, T.f32, shape=(ACC_ELEMS,))
+            acc_lds = STensor(smem_acc_ptr, T.f32, shape=(ACC_ELEMS,))
 
             my_out_row = fx.Int32(bid) * fx.Int32(const_expr(BLOCK_M)) + tid
             valid_thread = arith.cmpi(arith.CmpIPredicate.slt, my_out_row, num_act_out_val)
-            out_row_base = fx.Index(my_out_row) * fx.Index(const_expr(C_OUT))
+            acc_base = fx.Index(tid) * fx.Index(const_expr(C_OUT))
 
-            # Register accumulators — zero-initialized, persist across all kv
-            # We use output buffer as accumulator (pre-zeroed by caller)
+            # Zero-init LDS accumulator (each thread zeroes its own C_OUT elements)
+            zero_vec = vector.splat(T.vec(const_expr(ACC_VEC), T.f32),
+                                    arith.constant(0.0, type=T.f32))
+            for zi in range_constexpr(ACC_VEC_ITERS):
+                acc_lds.vec_store((acc_base + fx.Index(const_expr(zi * ACC_VEC)),),
+                                 zero_vec, const_expr(ACC_VEC))
+            gpu.barrier()
 
+            # K-fused loop: iterate all kv, accumulate in LDS
             for k in range_constexpr(KV):
                 mask_idx = fx.Index(bid) * fx.Index(const_expr(KV)) + fx.Index(const_expr(k))
                 is_active = arith.cmpi(arith.CmpIPredicate.ne,
@@ -690,13 +700,7 @@ def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
                                        fx.Int32(arith.constant(0, type=T.i32)))
                 kv_if = scf.IfOp(is_active, results_=[], has_else=False)
                 with ir.InsertionPoint(kv_if.then_block):
-                    # Select current LDS buffer (ping-pong by kv index parity)
-                    if const_expr(k % 2 == 0):
-                        w_lds_cur = w_lds_0
-                    else:
-                        w_lds_cur = w_lds_1
-
-                    # Load current kv weight to current LDS buffer
+                    # Cooperative weight load to LDS
                     w_base = fx.Index(const_expr(k * W_ELEMS))
                     for wi in range_constexpr(W_VEC_LOAD_PER_THREAD):
                         w_elem_idx = fx.Index(const_expr(wi * BLOCK_M * LDG_VEC)) + fx.Index(tid) * fx.Index(const_expr(LDG_VEC))
@@ -704,11 +708,11 @@ def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
                         w_if = scf.IfOp(w_valid, results_=[], has_else=False)
                         with ir.InsertionPoint(w_if.then_block):
                             w_vec = w_.vec_load((w_base + w_elem_idx,), const_expr(LDG_VEC))
-                            w_lds_cur.vec_store((w_elem_idx,), w_vec, const_expr(LDG_VEC))
+                            w_lds.vec_store((w_elem_idx,), w_vec, const_expr(LDG_VEC))
                             scf.YieldOp([])
                     gpu.barrier()
 
-                    # Compute: lut lookup + dot product (accumulate in output buffer)
+                    # Compute: accumulate into LDS acc (not global!)
                     thread_if = scf.IfOp(valid_thread, results_=[], has_else=False)
                     with ir.InsertionPoint(thread_if.then_block):
                         lut_idx = fx.Index(bid) * fx.Index(const_expr(KV * BLOCK_M)) + \
@@ -721,8 +725,8 @@ def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
                             feat_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
 
                             for j in range_constexpr(C_OUT_VECS):
-                                out_off = out_row_base + fx.Index(const_expr(j * OUT_VEC))
-                                acc = out_.vec_load((out_off,), const_expr(OUT_VEC))
+                                acc_off = acc_base + fx.Index(const_expr(j * OUT_VEC))
+                                acc = acc_lds.vec_load((acc_off,), const_expr(OUT_VEC))
 
                                 for c in range_constexpr(C_IN):
                                     f_val = feat_.load(feat_base + fx.Index(const_expr(c)))
@@ -732,7 +736,7 @@ def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
                                         T.vec(const_expr(OUT_VEC), T.f32), f_val)
 
                                     w_off = fx.Index(const_expr(c * C_OUT + j * OUT_VEC))
-                                    w_vec = w_lds_cur.vec_load((w_off,), const_expr(OUT_VEC))
+                                    w_vec = w_lds.vec_load((w_off,), const_expr(OUT_VEC))
                                     if const_expr(NEED_EXTF):
                                         w_f32_elems = []
                                         for ve in range_constexpr(OUT_VEC):
@@ -747,12 +751,23 @@ def _compile_implicit_gemm_v5(c_in: int, c_out: int, kv: int, dtype_str: str):
 
                                     acc = arith.addf(acc, arith.mulf(f_bcast, w_f32))
 
-                                out_.vec_store((out_off,), acc, const_expr(OUT_VEC))
+                                acc_lds.vec_store((acc_off,), acc, const_expr(OUT_VEC))
 
                             scf.YieldOp([])
                         scf.YieldOp([])
                     gpu.barrier()
                     scf.YieldOp([])
+
+            # Epilogue: LDS acc → global output (one store per thread)
+            out_row_base = fx.Index(my_out_row) * fx.Index(const_expr(C_OUT))
+            ep_if = scf.IfOp(valid_thread, results_=[], has_else=False)
+            with ir.InsertionPoint(ep_if.then_block):
+                for j in range_constexpr(C_OUT_VECS):
+                    acc_off = acc_base + fx.Index(const_expr(j * OUT_VEC))
+                    out_off = out_row_base + fx.Index(const_expr(j * OUT_VEC))
+                    final_acc = acc_lds.vec_load((acc_off,), const_expr(OUT_VEC))
+                    out_.vec_store((out_off,), final_acc, const_expr(OUT_VEC))
+                scf.YieldOp([])
 
         return kernel
 
