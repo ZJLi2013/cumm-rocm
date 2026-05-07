@@ -306,6 +306,28 @@ class TestMemoryLayout:
                 assert lds_idx == c * c_out + j, "Weight LDS layout mismatch"
 
 
+class TestImplicitGemmDispatch:
+    """Verify shape-based kernel family dispatch decisions."""
+
+    def test_f32_cout32_prefers_n2(self):
+        from cumm.implicit_gemm import select_implicit_gemm_kernel
+
+        desp = select_implicit_gemm_kernel(torch.float32, c_in=32, c_out=32)
+        assert desp.name == "mfma_f32_16x16x4f32_n2"
+
+    def test_f32_cout16_prefers_single_mfma(self):
+        from cumm.implicit_gemm import select_implicit_gemm_kernel
+
+        desp = select_implicit_gemm_kernel(torch.float32, c_in=32, c_out=16)
+        assert desp.name == "mfma_f32_16x16x4f32"
+
+    def test_f16_uses_scalar_fallback(self):
+        from cumm.implicit_gemm import select_implicit_gemm_kernel
+
+        desp = select_implicit_gemm_kernel(torch.float16, c_in=32, c_out=32)
+        assert desp.name == "scalar_tile"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 class TestInpRowLut:
     """Test inp_row_lut correctness."""

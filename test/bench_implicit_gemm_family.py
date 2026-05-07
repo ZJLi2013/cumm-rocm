@@ -75,9 +75,11 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
         MFMA_F32_16X16X4F32_N2_COMPILED_KERNELS,
         SCALAR_TILE_COMPILED_KERNELS,
         _get_hip_module,
+        implicit_gemm_forward,
         implicit_gemm_mfma_f32_16x16x4f32_forward,
         implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
         implicit_gemm_scalar_tile_forward,
+        select_implicit_gemm_kernel,
     )
     from cumm.implicit_gemm_common import _pack_weights
 
@@ -98,6 +100,21 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
         lambda: reference_indice_conv(features, filters, ip, ipn, n_active),
         label="[A] Python for-loop (gather+mm+scatter)",
     )
+
+    selected = select_implicit_gemm_kernel(dtype, c_in, c_out)
+    print(f"  dispatch selected: {selected.name}")
+    impl_dispatch = implicit_gemm_forward(features, filters, ip, ipn, n_active)
+    if impl_dispatch is not None:
+        print(
+            f"  dispatch max error: "
+            f"{(impl_dispatch.float() - ref.float()).abs().max().item():.6f}"
+        )
+        bench_fn(
+            lambda: implicit_gemm_forward(features, filters, ip, ipn, n_active),
+            label="[D] dispatch full",
+        )
+    else:
+        print("  [WARN] dispatch failed, continuing per-kernel benchmarks")
 
     hip = _get_hip_module()
     dtype_str = _dtype_str(dtype)
