@@ -85,13 +85,13 @@ def _compile_implicit_gemm_mfma_f32_32x32x2f32(
         row_tile_base = m_tile * fx.Int32(const_expr(BLOCK_M))
         c_out_offset = fx.Index(ct) * fx.Index(const_expr(C_OUT_TILE))
 
-        # MFMA 32x32x2f32 lane layout mirrors the 16x16 kernel, but each lane
-        # owns 16 accumulator rows for one output column.
+        # For 32x32 MFMA, lane % 32 owns the M row. The 16 accumulator
+        # elements cover a swizzled subset of N columns; lane // 32 selects the
+        # complementary half.
         lane = tid
         mfma_row = lane % fx.Int32(const_expr(32))
         mfma_col = lane % fx.Int32(const_expr(32))
         mfma_k_lane = lane // fx.Int32(const_expr(32))
-        c_row_vec_base = (lane // fx.Int32(const_expr(32))) * fx.Int32(const_expr(16))
 
         zero_f32 = arith.constant(0.0, type=T.f32)
         zero_acc = arith.constant_vector(0.0, T.vec(16, T.f32))
@@ -177,7 +177,7 @@ def _compile_implicit_gemm_mfma_f32_32x32x2f32(
 
         final_acc = fx.memref_load_vec(acc_reg)
         for ri in range_constexpr(16):
-            store_row = row_tile_base + c_row_vec_base + fx.Int32(const_expr(ri))
+            store_row = row_tile_base + mfma_row
             store_ok = arith.cmpi(
                 arith.CmpIPredicate.slt, store_row, num_act_out_val
             )
@@ -189,7 +189,8 @@ def _compile_implicit_gemm_mfma_f32_32x32x2f32(
                 out_off = (
                     fx.Index(store_row) * fx.Index(const_expr(C_OUT))
                     + c_out_offset
-                    + fx.Index(mfma_col)
+                    + fx.Index(mfma_k_lane) * fx.Index(const_expr(4))
+                    + fx.Index(const_expr((ri // 4) * 8 + (ri % 4)))
                 )
                 out_.store(out_off, val)
                 scf.YieldOp([])

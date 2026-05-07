@@ -127,7 +127,35 @@ def get_implicit_gemm_candidates(dtype, c_in: int, c_out: int) -> List[ImplicitG
         for desp in IMPLICIT_GEMM_KERNEL_DESPS
         if desp.is_available(dtype_str, c_in, c_out)
     ]
-    return sorted(candidates, key=lambda desp: desp.priority, reverse=True)
+    by_name = {desp.name: desp for desp in candidates}
+
+    # Current benchmark data shows MFMA is only competitive for the smallest
+    # channel bucket. Keep scalar first elsewhere until a candidate proves faster.
+    if dtype_str == "f32" and c_in <= 16:
+        preferred_names = [
+            "mfma_f32_16x16x4f32",
+            "mfma_f32_16x16x4f32_n2",
+            "mfma_f32_32x32x2f32",
+            "scalar_tile",
+        ]
+    else:
+        preferred_names = [
+            "scalar_tile",
+            "mfma_f32_32x32x2f32",
+            "mfma_f32_16x16x4f32_n2",
+            "mfma_f32_16x16x4f32",
+        ]
+
+    ordered = [by_name[name] for name in preferred_names if name in by_name]
+    ordered_names = {desp.name for desp in ordered}
+    ordered.extend(
+        sorted(
+            (desp for desp in candidates if desp.name not in ordered_names),
+            key=lambda desp: desp.priority,
+            reverse=True,
+        )
+    )
+    return ordered
 
 
 def select_implicit_gemm_kernel(dtype, c_in: int, c_out: int) -> ImplicitGemmKernelDesp:

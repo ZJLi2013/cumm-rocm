@@ -309,17 +309,17 @@ class TestMemoryLayout:
 class TestImplicitGemmDispatch:
     """Verify shape-based kernel family dispatch decisions."""
 
-    def test_f32_cout32_prefers_n2(self):
+    def test_small_f32_prefers_single_mfma(self):
+        from cumm.implicit_gemm import select_implicit_gemm_kernel
+
+        desp = select_implicit_gemm_kernel(torch.float32, c_in=16, c_out=32)
+        assert desp.name == "mfma_f32_16x16x4f32"
+
+    def test_mid_f32_prefers_scalar_until_mfma_wins(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
 
         desp = select_implicit_gemm_kernel(torch.float32, c_in=32, c_out=32)
-        assert desp.name == "mfma_f32_16x16x4f32_n2"
-
-    def test_f32_cout16_prefers_single_mfma(self):
-        from cumm.implicit_gemm import select_implicit_gemm_kernel
-
-        desp = select_implicit_gemm_kernel(torch.float32, c_in=32, c_out=16)
-        assert desp.name == "mfma_f32_16x16x4f32"
+        assert desp.name == "scalar_tile"
 
     def test_f16_uses_scalar_fallback(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
