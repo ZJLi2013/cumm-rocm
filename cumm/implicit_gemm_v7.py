@@ -1,11 +1,12 @@
-"""V7: V6 (LDS acc + column tiling) + weight double buffer.
+"""V7: True K-fusion — register accumulator via memref_alloca.
 
-Overlaps weight prefetch for kv+1 with compute for kv, reducing
-barrier count from 2/kv to 1/kv.
+Replace V6's LDS accumulator with register-backed alloca storage.
+Accumulator lives in VGPR registers, persists across all kv iterations
+without reset. Uses FlyDSL's memref_alloca(AddressSpace.Register) +
+memref_load_vec/memref_store_vec for mutable register state that
+survives scf.IfOp blocks (PromoteRegMemToVectorSSA handles SSA conversion).
 
-LDS layout: weight_A[C_IN*C_OUT_TILE] + weight_B[C_IN*C_OUT_TILE]
-          + acc[BLOCK_M*C_OUT_TILE] (f32).
-
+LDS: only weight tile (no acc) → lower LDS, higher occupancy.
 Weight pre-packed as [kv, N_TILES, C_IN, C_OUT_TILE] (same as V6).
 """
 import math
@@ -45,7 +46,6 @@ def _compile_implicit_gemm_v7(c_in: int, c_out: int, kv: int, dtype_str: str):
     N_C_OUT_TILES = C_OUT // C_OUT_TILE
 
     W_TILE_ELEMS = C_IN * C_OUT_TILE
-    ACC_TILE_ELEMS = BLOCK_M * C_OUT_TILE
     OUT_VEC = min(4, C_OUT_TILE)
     C_OUT_TILE_VECS = C_OUT_TILE // OUT_VEC
 
@@ -57,20 +57,14 @@ def _compile_implicit_gemm_v7(c_in: int, c_out: int, kv: int, dtype_str: str):
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
     W_TILE_BYTES = W_TILE_ELEMS * DT_BYTES
-    ACC_TILE_BYTES = ACC_TILE_ELEMS * 4
 
+    # LDS: only weight tile (no acc tile needed — acc is in registers)
     allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig_v7")
-    smem_wA_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_wA_offset + W_TILE_BYTES
-    smem_wB_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_wB_offset + W_TILE_BYTES
-    smem_acc_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_acc_offset + ACC_TILE_BYTES
+    smem_w_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = smem_w_offset + W_TILE_BYTES
 
     LDG_VEC = min(4, W_TILE_ELEMS)
     W_VEC_LOAD_PER_THREAD = math.ceil(W_TILE_ELEMS / (BLOCK_M * LDG_VEC))
-    ACC_VEC = min(4, C_OUT_TILE)
-    ACC_VEC_ITERS = C_OUT_TILE // ACC_VEC
 
     def _make_kernel_v7(is_f32=True, use_f16=True):
         NEED_EXTF = not is_f32
@@ -91,41 +85,35 @@ def _compile_implicit_gemm_v7(c_in: int, c_out: int, kv: int, dtype_str: str):
             mask_ = GTensor(mask, dtype=T.i32, shape=(-1,))
 
             base_ptr = allocator.get_base()
-            smem_wA_ptr = SmemPtr(base_ptr, smem_wA_offset, dt, shape=(W_TILE_ELEMS,))
-            smem_wB_ptr = SmemPtr(base_ptr, smem_wB_offset, dt, shape=(W_TILE_ELEMS,))
-            w_lds_A = STensor(smem_wA_ptr, dt, shape=(W_TILE_ELEMS,))
-            w_lds_B = STensor(smem_wB_ptr, dt, shape=(W_TILE_ELEMS,))
-            smem_acc_ptr = SmemPtr(base_ptr, smem_acc_offset, T.f32, shape=(ACC_TILE_ELEMS,))
-            acc_lds = STensor(smem_acc_ptr, T.f32, shape=(ACC_TILE_ELEMS,))
+            smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, dt, shape=(W_TILE_ELEMS,))
+            w_lds = STensor(smem_w_ptr, dt, shape=(W_TILE_ELEMS,))
 
             my_out_row = fx.Int32(bid) * fx.Int32(const_expr(BLOCK_M)) + tid
             valid_thread = arith.cmpi(arith.CmpIPredicate.slt, my_out_row, num_act_out_val)
             out_row_base = fx.Index(my_out_row) * fx.Index(const_expr(C_OUT))
-            acc_base = fx.Index(tid) * fx.Index(const_expr(C_OUT_TILE))
 
             zero_scalar = arith.constant(0.0, type=T.f32)
-            zero_vec = vector.broadcast(T.vec(const_expr(ACC_VEC), T.f32), zero_scalar)
+            zero_vec = vector.broadcast(T.vec(const_expr(OUT_VEC), T.f32), zero_scalar)
+
+            # Allocate register accumulators via memref_alloca
+            # Each accumulator is a vec<OUT_VEC x f32> in register address space
+            acc_reg_ty = fx.MemRefType.get(
+                T.f32, fx.LayoutType.get(const_expr(OUT_VEC), 1),
+                fx.AddressSpace.Register
+            )
+            acc_reg_lay = fx.make_layout(const_expr(OUT_VEC), 1)
 
             for ct in range_constexpr(N_C_OUT_TILES):
                 c_out_offset = fx.Index(const_expr(ct * C_OUT_TILE))
 
-                # Zero LDS accumulator
-                for zi in range_constexpr(ACC_VEC_ITERS):
-                    acc_lds.vec_store((acc_base + fx.Index(const_expr(zi * ACC_VEC)),),
-                                     zero_vec, const_expr(ACC_VEC))
+                # Allocate and zero-init register accumulators
+                acc_regs = []
+                for j in range_constexpr(C_OUT_TILE_VECS):
+                    reg = fx.memref_alloca(acc_reg_ty, acc_reg_lay)
+                    fx.memref_store_vec(zero_vec, reg)
+                    acc_regs.append(reg)
 
-                # Double-buffer pipeline:
-                #   even kv → load into w_lds_A, compute from w_lds_A
-                #   odd kv  → load into w_lds_B, compute from w_lds_B
-                #
-                # Because compute(k) uses buffer X and load(k+1) uses buffer Y
-                # (X != Y), we only need ONE barrier between load+compute of the
-                # SAME kv (to make load visible), but NO barrier between
-                # compute(k) and load(k+1) since they touch different LDS regions.
-                #
-                # V6 needs 2 barriers/kv: load→barrier→compute→barrier(protect load buf)
-                # V7 needs 1 barrier/kv: load→barrier→compute (next load goes to other buf)
-
+                # K-fusion: iterate all kv, accumulate in register
                 for k in range_constexpr(KV):
                     mask_idx = fx.Index(bid) * fx.Index(const_expr(KV)) + fx.Index(const_expr(k))
                     is_active = arith.cmpi(arith.CmpIPredicate.ne,
@@ -133,11 +121,7 @@ def _compile_implicit_gemm_v7(c_in: int, c_out: int, kv: int, dtype_str: str):
                                            fx.Int32(arith.constant(0, type=T.i32)))
                     kv_if = scf.IfOp(is_active, results_=[], has_else=False)
                     with ir.InsertionPoint(kv_if.then_block):
-                        if const_expr(k % 2 == 0):
-                            w_lds_cur = w_lds_A
-                        else:
-                            w_lds_cur = w_lds_B
-
+                        # Cooperative weight tile load
                         w_base = fx.Index(const_expr(k * N_C_OUT_TILES * W_TILE_ELEMS + ct * W_TILE_ELEMS))
                         for wi in range_constexpr(W_VEC_LOAD_PER_THREAD):
                             w_elem_idx = fx.Index(const_expr(wi * BLOCK_M * LDG_VEC)) + fx.Index(tid) * fx.Index(const_expr(LDG_VEC))
@@ -145,11 +129,11 @@ def _compile_implicit_gemm_v7(c_in: int, c_out: int, kv: int, dtype_str: str):
                             w_if = scf.IfOp(w_valid, results_=[], has_else=False)
                             with ir.InsertionPoint(w_if.then_block):
                                 w_vec = wp_.vec_load((w_base + w_elem_idx,), const_expr(LDG_VEC))
-                                w_lds_cur.vec_store((w_elem_idx,), w_vec, const_expr(LDG_VEC))
+                                w_lds.vec_store((w_elem_idx,), w_vec, const_expr(LDG_VEC))
                                 scf.YieldOp([])
-
                         gpu.barrier()
 
+                        # Compute: accumulate into register acc (not LDS!)
                         thread_if = scf.IfOp(valid_thread, results_=[], has_else=False)
                         with ir.InsertionPoint(thread_if.then_block):
                             lut_idx = fx.Index(bid) * fx.Index(const_expr(KV * BLOCK_M)) + \
@@ -161,19 +145,16 @@ def _compile_implicit_gemm_v7(c_in: int, c_out: int, kv: int, dtype_str: str):
                             with ir.InsertionPoint(pair_if.then_block):
                                 feat_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
 
-                                for j in range_constexpr(C_OUT_TILE_VECS):
-                                    acc_off = acc_base + fx.Index(const_expr(j * OUT_VEC))
-                                    acc = acc_lds.vec_load((acc_off,), const_expr(OUT_VEC))
+                                for c in range_constexpr(C_IN):
+                                    f_val = feat_.load(feat_base + fx.Index(const_expr(c)))
+                                    if const_expr(NEED_EXTF):
+                                        f_val = arith.extf(T.f32, f_val)
+                                    f_bcast = vector.broadcast(
+                                        T.vec(const_expr(OUT_VEC), T.f32), f_val)
 
-                                    for c in range_constexpr(C_IN):
-                                        f_val = feat_.load(feat_base + fx.Index(const_expr(c)))
-                                        if const_expr(NEED_EXTF):
-                                            f_val = arith.extf(T.f32, f_val)
-                                        f_bcast = vector.broadcast(
-                                            T.vec(const_expr(OUT_VEC), T.f32), f_val)
-
+                                    for j in range_constexpr(C_OUT_TILE_VECS):
                                         w_off = fx.Index(const_expr(c * C_OUT_TILE + j * OUT_VEC))
-                                        w_vec = w_lds_cur.vec_load((w_off,), const_expr(OUT_VEC))
+                                        w_vec = w_lds.vec_load((w_off,), const_expr(OUT_VEC))
                                         if const_expr(NEED_EXTF):
                                             w_f32_elems = []
                                             for ve in range_constexpr(OUT_VEC):
@@ -186,25 +167,24 @@ def _compile_implicit_gemm_v7(c_in: int, c_out: int, kv: int, dtype_str: str):
                                         else:
                                             w_f32 = w_vec
 
-                                        acc = arith.addf(acc, arith.mulf(f_bcast, w_f32))
-
-                                    acc_lds.vec_store((acc_off,), acc, const_expr(OUT_VEC))
+                                        # Load acc from register, FMA, store back
+                                        cur_acc = fx.memref_load_vec(acc_regs[const_expr(j)])
+                                        new_acc = arith.addf(cur_acc, arith.mulf(f_bcast, w_f32))
+                                        fx.memref_store_vec(new_acc, acc_regs[const_expr(j)])
 
                                 scf.YieldOp([])
                             scf.YieldOp([])
+                        gpu.barrier()
                         scf.YieldOp([])
 
-                # Epilogue: LDS acc → global output for this tile
-                gpu.barrier()
+                # Epilogue: register acc → global output
                 ep_if = scf.IfOp(valid_thread, results_=[], has_else=False)
                 with ir.InsertionPoint(ep_if.then_block):
                     for j in range_constexpr(C_OUT_TILE_VECS):
-                        acc_off = acc_base + fx.Index(const_expr(j * OUT_VEC))
                         out_off = out_row_base + c_out_offset + fx.Index(const_expr(j * OUT_VEC))
-                        final_acc = acc_lds.vec_load((acc_off,), const_expr(OUT_VEC))
+                        final_acc = fx.memref_load_vec(acc_regs[const_expr(j)])
                         out_.vec_store((out_off,), final_acc, const_expr(OUT_VEC))
                     scf.YieldOp([])
-                gpu.barrier()
 
         return kernel
 
@@ -251,7 +231,7 @@ def implicit_gemm_v7_forward(
     indice_pair_num: torch.Tensor,
     num_activate_out: int,
 ) -> Optional[torch.Tensor]:
-    """V7: V6 + weight double buffer for K-fusion pipelining."""
+    """V7: True K-fusion with register accumulators."""
     try:
         import flydsl
     except ImportError:
