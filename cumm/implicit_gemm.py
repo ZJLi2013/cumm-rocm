@@ -1,5 +1,6 @@
 """FlyDSL implicit GEMM kernel family public entry."""
 
+import os
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -128,6 +129,16 @@ def get_implicit_gemm_candidates(dtype, c_in: int, c_out: int) -> List[ImplicitG
         if desp.is_available(dtype_str, c_in, c_out)
     ]
     by_name = {desp.name: desp for desp in candidates}
+    forced_kernel = os.environ.get("CUMM_IMPLICIT_GEMM_KERNEL", "auto").strip()
+    if forced_kernel and forced_kernel != "auto":
+        if forced_kernel not in IMPLICIT_GEMM_KERNELS:
+            raise ValueError(f"Unknown implicit GEMM kernel: {forced_kernel}")
+        if forced_kernel not in by_name:
+            raise ValueError(
+                f"Implicit GEMM kernel {forced_kernel} is not available for "
+                f"dtype={dtype_str}, C_in={c_in}, C_out={c_out}"
+            )
+        return [by_name[forced_kernel]]
 
     # Current benchmark data shows MFMA is only competitive for the smallest
     # channel bucket. Keep scalar first elsewhere until a candidate proves faster.

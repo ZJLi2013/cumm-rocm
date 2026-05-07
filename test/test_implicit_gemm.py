@@ -327,6 +327,20 @@ class TestImplicitGemmDispatch:
         desp = select_implicit_gemm_kernel(torch.float16, c_in=32, c_out=32)
         assert desp.name == "scalar_tile"
 
+    def test_env_force_kernel(self, monkeypatch):
+        from cumm.implicit_gemm import select_implicit_gemm_kernel
+
+        monkeypatch.setenv("CUMM_IMPLICIT_GEMM_KERNEL", "scalar_tile")
+        desp = select_implicit_gemm_kernel(torch.float32, c_in=16, c_out=32)
+        assert desp.name == "scalar_tile"
+
+    def test_env_force_unavailable_kernel(self, monkeypatch):
+        from cumm.implicit_gemm import select_implicit_gemm_kernel
+
+        monkeypatch.setenv("CUMM_IMPLICIT_GEMM_KERNEL", "mfma_f32_16x16x4f32")
+        with pytest.raises(ValueError):
+            select_implicit_gemm_kernel(torch.float16, c_in=16, c_out=32)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 class TestInpRowLut:
