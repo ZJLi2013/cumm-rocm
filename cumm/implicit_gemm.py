@@ -43,9 +43,16 @@ from cumm.implicit_gemm_v6 import (
     implicit_gemm_v6_forward,
 )
 
-# V7: K-fused double-buffer
+# V7: register accumulator scalar baseline
 from cumm.implicit_gemm_v7 import (
     _V7_COMPILED_KERNELS,
     _compile_implicit_gemm_v7,
     implicit_gemm_v7_forward,
+)
+
+# V8: tile-owned scalar baseline
+from cumm.implicit_gemm_v8 import (
+    _V8_COMPILED_KERNELS,
+    _compile_implicit_gemm_v8,
+    implicit_gemm_v8_forward,
 )
