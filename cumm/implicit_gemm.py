@@ -35,3 +35,10 @@ from cumm.implicit_gemm_v5 import (
     _compile_implicit_gemm_v5,
     implicit_gemm_v5_forward,
 )
+
+# V6: Output-tiled (column tiling)
+from cumm.implicit_gemm_v6 import (
+    _V6_COMPILED_KERNELS,
+    _compile_implicit_gemm_v6,
+    implicit_gemm_v6_forward,
+)
