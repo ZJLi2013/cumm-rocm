@@ -169,7 +169,7 @@ def _compile_implicit_gemm_v8c(c_in: int, c_out: int, kv: int, dtype_str: str):
                     b_val = w_lds.load(b_off)
                     cur_acc = fx.memref_load_vec(acc_reg)
                     new_acc = rocdl.mfma_f32_16x16x4f32(
-                        T.vec(4, T.f32), [a_val, b_val, cur_acc, 0, 0, 0]
+                        T.vec(4, T.f32), a_val, b_val, cur_acc, 0, 0, 0
                     )
                     fx.memref_store_vec(new_acc, acc_reg)
 
