@@ -1,12 +1,12 @@
-"""V8b: tile-owned scalar implicit GEMM with A/B LDS tiles.
+﻿"""V8a: tile-owned scalar implicit GEMM baseline.
 
 This is a minimal step from V7 toward a CUDA-style tile kernel:
-  - block owns a BLOCK_M x C_OUT_TILE output tile
+  - keep V7 data path: A/features global -> register, B/weight -> LDS, C -> register
+  - change work ownership: block owns a BLOCK_M x C_OUT_TILE output tile
   - each thread owns one (output row, output-channel vector) inside the tile
-  - A/features are gathered into LDS, B/weight is loaded into LDS, C stays in regs
 
-It is intentionally still scalar FMA (no MFMA, no double buffer) so V8a and
-V8b can be compared as a pure A-LDS structural change.
+It is intentionally still scalar FMA (no MFMA, no A LDS) so V7 and V8a can
+be compared as a pure ownership/mapping change.
 """
 import math
 import warnings
@@ -21,10 +21,10 @@ from cumm.implicit_gemm_common import (
 )
 from cumm.implicit_gemm_v6 import C_OUT_TILE_MAX, _pack_weights
 
-_V8_COMPILED_KERNELS: Dict = {}
+_V8A_COMPILED_KERNELS: Dict = {}
 
 
-def _compile_implicit_gemm_v8(c_in: int, c_out: int, kv: int, dtype_str: str):
+def _compile_implicit_gemm_v8a(c_in: int, c_out: int, kv: int, dtype_str: str):
     _ensure_flydsl_path()
 
     import flydsl.compiler as flyc
@@ -48,7 +48,6 @@ def _compile_implicit_gemm_v8(c_in: int, c_out: int, kv: int, dtype_str: str):
     C_OUT_TILE_VECS = C_OUT_TILE // OUT_VEC
     BLOCK_THREADS = BLOCK_M * C_OUT_TILE_VECS
 
-    A_TILE_ELEMS = BLOCK_M * C_IN
     W_TILE_ELEMS = C_IN * C_OUT_TILE
     if dtype_str == "f32":
         DT_BYTES = 4
@@ -57,17 +56,12 @@ def _compile_implicit_gemm_v8(c_in: int, c_out: int, kv: int, dtype_str: str):
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
-    A_TILE_BYTES = A_TILE_ELEMS * DT_BYTES
     W_TILE_BYTES = W_TILE_ELEMS * DT_BYTES
-    allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig_v8")
-    smem_a_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_a_offset + A_TILE_BYTES
+    allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig_v8a")
     smem_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_w_offset + W_TILE_BYTES
 
-    A_LDG_VEC = min(4, C_IN)
     LDG_VEC = min(4, W_TILE_ELEMS)
-    A_VEC_LOAD_PER_THREAD = math.ceil(A_TILE_ELEMS / (BLOCK_THREADS * A_LDG_VEC))
     W_VEC_LOAD_PER_THREAD = math.ceil(W_TILE_ELEMS / (BLOCK_THREADS * LDG_VEC))
 
     def _make_kernel_v8(is_f32=True, use_f16=True):
@@ -89,8 +83,6 @@ def _compile_implicit_gemm_v8(c_in: int, c_out: int, kv: int, dtype_str: str):
             mask_ = GTensor(mask, dtype=T.i32, shape=(-1,))
 
             base_ptr = allocator.get_base()
-            smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dt, shape=(A_TILE_ELEMS,))
-            a_lds = STensor(smem_a_ptr, dt, shape=(A_TILE_ELEMS,))
             smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, dt, shape=(W_TILE_ELEMS,))
             w_lds = STensor(smem_w_ptr, dt, shape=(W_TILE_ELEMS,))
 
@@ -140,57 +132,6 @@ def _compile_implicit_gemm_v8(c_in: int, c_out: int, kv: int, dtype_str: str):
                                 w_vec = wp_.vec_load((w_base + w_elem_idx,), const_expr(LDG_VEC))
                                 w_lds.vec_store((w_elem_idx,), w_vec, const_expr(LDG_VEC))
                                 scf.YieldOp([])
-
-                        # Cooperative A/features gather into LDS.
-                        # A tile layout: [BLOCK_M, C_IN], indexed by local output row.
-                        for ai in range_constexpr(A_VEC_LOAD_PER_THREAD):
-                            a_elem_i32 = (
-                                fx.Int32(const_expr(ai * BLOCK_THREADS * A_LDG_VEC))
-                                + tid * fx.Int32(const_expr(A_LDG_VEC))
-                            )
-                            a_valid = arith.cmpi(
-                                arith.CmpIPredicate.ult,
-                                a_elem_i32,
-                                fx.Int32(const_expr(A_TILE_ELEMS)),
-                            )
-                            a_if = scf.IfOp(a_valid, results_=[], has_else=False)
-                            with ir.InsertionPoint(a_if.then_block):
-                                a_row = a_elem_i32 // fx.Int32(const_expr(C_IN))
-                                a_col = a_elem_i32 % fx.Int32(const_expr(C_IN))
-                                a_out_row = bid * fx.Int32(const_expr(BLOCK_M)) + a_row
-                                a_row_valid = arith.cmpi(
-                                    arith.CmpIPredicate.slt, a_out_row, num_act_out_val
-                                )
-                                row_if = scf.IfOp(a_row_valid, results_=[], has_else=False)
-                                with ir.InsertionPoint(row_if.then_block):
-                                    a_lut_idx = (
-                                        fx.Index(bid) * fx.Index(const_expr(KV * BLOCK_M))
-                                        + fx.Index(const_expr(k * BLOCK_M))
-                                        + fx.Index(a_row)
-                                    )
-                                    a_inp_row = lut_.load(a_lut_idx)
-                                    a_has_pair = arith.cmpi(
-                                        arith.CmpIPredicate.sge,
-                                        a_inp_row,
-                                        fx.Int32(arith.constant(0, type=T.i32)),
-                                    )
-                                    pair_load_if = scf.IfOp(
-                                        a_has_pair, results_=[], has_else=False
-                                    )
-                                    with ir.InsertionPoint(pair_load_if.then_block):
-                                        feat_off = (
-                                            fx.Index(a_inp_row) * fx.Index(const_expr(C_IN))
-                                            + fx.Index(a_col)
-                                        )
-                                        a_vec = feat_.vec_load((feat_off,), const_expr(A_LDG_VEC))
-                                        a_lds.vec_store(
-                                            (fx.Index(a_elem_i32),),
-                                            a_vec,
-                                            const_expr(A_LDG_VEC),
-                                        )
-                                        scf.YieldOp([])
-                                    scf.YieldOp([])
-                                scf.YieldOp([])
                         gpu.barrier()
 
                         thread_if = scf.IfOp(valid_thread, results_=[], has_else=False)
@@ -208,12 +149,10 @@ def _compile_implicit_gemm_v8(c_in: int, c_out: int, kv: int, dtype_str: str):
                             )
                             pair_if = scf.IfOp(has_pair, results_=[], has_else=False)
                             with ir.InsertionPoint(pair_if.then_block):
+                                feat_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
+
                                 for c in range_constexpr(C_IN):
-                                    a_off = (
-                                        fx.Index(row_lane) * fx.Index(const_expr(C_IN))
-                                        + fx.Index(const_expr(c))
-                                    )
-                                    f_val = a_lds.load(a_off)
+                                    f_val = feat_.load(feat_base + fx.Index(const_expr(c)))
                                     if const_expr(NEED_EXTF):
                                         f_val = arith.extf(T.f32, f_val)
                                     f_bcast = vector.broadcast(T.vec(const_expr(OUT_VEC), T.f32), f_val)
@@ -296,14 +235,14 @@ def _compile_implicit_gemm_v8(c_in: int, c_out: int, kv: int, dtype_str: str):
     return launch_fn, BLOCK_M
 
 
-def implicit_gemm_v8_forward(
+def implicit_gemm_v8a_forward(
     features: torch.Tensor,
     filters: torch.Tensor,
     indice_pairs: torch.Tensor,
     indice_pair_num: torch.Tensor,
     num_activate_out: int,
 ) -> Optional[torch.Tensor]:
-    """V8b: tile-owned scalar baseline with A/B LDS tiles."""
+    """V8a: tile-owned scalar baseline based on V7."""
     try:
         import flydsl  # noqa: F401
     except ImportError:
@@ -336,11 +275,11 @@ def implicit_gemm_v8_forward(
     if sorted_inp.shape[0] == 0:
         return torch.zeros(num_activate_out, c_out, dtype=torch.float32, device=device)
 
-    key = ("v8", c_in, c_out, kv, dtype_str)
-    if key not in _V8_COMPILED_KERNELS:
+    key = ("v8a", c_in, c_out, kv, dtype_str)
+    if key not in _V8A_COMPILED_KERNELS:
         try:
-            launch_fn, block_m = _compile_implicit_gemm_v8(c_in, c_out, kv, dtype_str)
-            _V8_COMPILED_KERNELS[key] = (launch_fn, block_m)
+            launch_fn, block_m = _compile_implicit_gemm_v8a(c_in, c_out, kv, dtype_str)
+            _V8A_COMPILED_KERNELS[key] = (launch_fn, block_m)
         except Exception as e:
             import traceback
 
@@ -349,7 +288,7 @@ def implicit_gemm_v8_forward(
             )
             return None
     else:
-        launch_fn, block_m = _V8_COMPILED_KERNELS[key]
+        launch_fn, block_m = _V8A_COMPILED_KERNELS[key]
 
     c_out_tile = min(C_OUT_TILE_MAX, c_out)
     weights_packed = _pack_weights(filters, c_out_tile)

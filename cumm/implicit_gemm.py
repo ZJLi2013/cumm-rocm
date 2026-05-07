@@ -50,7 +50,14 @@ from cumm.implicit_gemm_v7 import (
     implicit_gemm_v7_forward,
 )
 
-# V8: tile-owned scalar baseline
+# V8a: tile-owned scalar baseline (kept for benchmark comparison)
+from cumm.implicit_gemm_v8a import (
+    _V8A_COMPILED_KERNELS,
+    _compile_implicit_gemm_v8a,
+    implicit_gemm_v8a_forward,
+)
+
+# V8b: tile-owned scalar baseline with A/B LDS tiles
 from cumm.implicit_gemm_v8 import (
     _V8_COMPILED_KERNELS,
     _compile_implicit_gemm_v8,

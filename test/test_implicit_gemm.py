@@ -620,7 +620,7 @@ class TestImplicitGemmV7:
 
 
 class TestImplicitGemmV8:
-    """V8a: tile-owned scalar baseline based on V7."""
+    """V8b: tile-owned scalar baseline with A/B LDS tiles."""
 
     @pytest.fixture(autouse=True)
     def _skip_no_gpu(self):
