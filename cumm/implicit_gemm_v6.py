@@ -1,14 +1,15 @@
-"""V6: Output-tiled implicit GEMM — column tiling to reduce LDS pressure.
+"""V6: V5 (LDS accumulator) + output column tiling.
 
-Splits C_OUT into C_OUT_TILE-sized blocks. Each tile pass only loads
-weight[C_IN × C_OUT_TILE] to LDS, drastically reducing LDS usage for
-large C_OUT (e.g. 128 → 4 passes of 32).
+Built on V5's core optimization (LDS acc eliminates per-kv global RMW),
+plus column tiling to handle large C_OUT without LDS saturation.
 
-Weight is pre-packed by the forward function into [kv, N_TILES, C_IN, C_OUT_TILE]
-so each (kv, tile) block is contiguous → enables vectorized cooperative LDS load.
+For each C_OUT tile:
+  - Zero LDS acc[BLOCK_M × C_OUT_TILE]
+  - For each kv: load weight tile → LDS, accumulate dot into LDS acc
+  - Write LDS acc → global output (one pass)
 
-LDS: weight_tile[C_IN * C_OUT_TILE] only (no acc LDS).
-Output uses global buffer as accumulator (pre-zeroed, like V4).
+LDS layout: weight[C_IN × C_OUT_TILE] + acc[BLOCK_M × C_OUT_TILE] (f32).
+Weight pre-packed as [kv, N_TILES, C_IN, C_OUT_TILE] for vectorized load.
 """
 import math
 import os
@@ -48,6 +49,7 @@ def _compile_implicit_gemm_v6(c_in: int, c_out: int, kv: int, dtype_str: str):
     N_C_OUT_TILES = C_OUT // C_OUT_TILE
 
     W_TILE_ELEMS = C_IN * C_OUT_TILE
+    ACC_TILE_ELEMS = BLOCK_M * C_OUT_TILE
     OUT_VEC = min(4, C_OUT_TILE)
     C_OUT_TILE_VECS = C_OUT_TILE // OUT_VEC
 
@@ -59,13 +61,18 @@ def _compile_implicit_gemm_v6(c_in: int, c_out: int, kv: int, dtype_str: str):
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
     W_TILE_BYTES = W_TILE_ELEMS * DT_BYTES
+    ACC_TILE_BYTES = ACC_TILE_ELEMS * 4  # always f32
 
     allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig_v6")
     smem_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_w_offset + W_TILE_BYTES
+    smem_acc_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = smem_acc_offset + ACC_TILE_BYTES
 
     LDG_VEC = min(4, W_TILE_ELEMS)
     W_VEC_LOAD_PER_THREAD = math.ceil(W_TILE_ELEMS / (BLOCK_M * LDG_VEC))
+    ACC_VEC = min(4, C_OUT_TILE)
+    ACC_VEC_ITERS = C_OUT_TILE // ACC_VEC
 
     def _make_kernel_v6(is_f32=True, use_f16=True):
         NEED_EXTF = not is_f32
@@ -88,14 +95,28 @@ def _compile_implicit_gemm_v6(c_in: int, c_out: int, kv: int, dtype_str: str):
             base_ptr = allocator.get_base()
             smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, dt, shape=(W_TILE_ELEMS,))
             w_lds = STensor(smem_w_ptr, dt, shape=(W_TILE_ELEMS,))
+            smem_acc_ptr = SmemPtr(base_ptr, smem_acc_offset, T.f32, shape=(ACC_TILE_ELEMS,))
+            acc_lds = STensor(smem_acc_ptr, T.f32, shape=(ACC_TILE_ELEMS,))
 
             my_out_row = fx.Int32(bid) * fx.Int32(const_expr(BLOCK_M)) + tid
             valid_thread = arith.cmpi(arith.CmpIPredicate.slt, my_out_row, num_act_out_val)
             out_row_base = fx.Index(my_out_row) * fx.Index(const_expr(C_OUT))
+            acc_base = fx.Index(tid) * fx.Index(const_expr(C_OUT_TILE))
 
+            zero_scalar = arith.constant(0.0, type=T.f32)
+            zero_vec = vector.broadcast(T.vec(const_expr(ACC_VEC), T.f32), zero_scalar)
+
+            # Outer loop: iterate over C_OUT tiles
             for ct in range_constexpr(N_C_OUT_TILES):
                 c_out_offset = fx.Index(const_expr(ct * C_OUT_TILE))
 
+                # Zero LDS accumulator for this tile
+                for zi in range_constexpr(ACC_VEC_ITERS):
+                    acc_lds.vec_store((acc_base + fx.Index(const_expr(zi * ACC_VEC)),),
+                                     zero_vec, const_expr(ACC_VEC))
+                gpu.barrier()
+
+                # Inner loop: iterate over all kv, accumulate in LDS acc
                 for k in range_constexpr(KV):
                     mask_idx = fx.Index(bid) * fx.Index(const_expr(KV)) + fx.Index(const_expr(k))
                     is_active = arith.cmpi(arith.CmpIPredicate.ne,
@@ -103,8 +124,7 @@ def _compile_implicit_gemm_v6(c_in: int, c_out: int, kv: int, dtype_str: str):
                                            fx.Int32(arith.constant(0, type=T.i32)))
                     kv_if = scf.IfOp(is_active, results_=[], has_else=False)
                     with ir.InsertionPoint(kv_if.then_block):
-                        # Weight is pre-packed as [kv, N_C_OUT_TILES, C_IN, C_OUT_TILE] contiguous
-                        # Base for this (kv=k, tile=ct) block:
+                        # Cooperative weight tile load (pre-packed contiguous)
                         w_base = fx.Index(const_expr(k * N_C_OUT_TILES * W_TILE_ELEMS + ct * W_TILE_ELEMS))
                         for wi in range_constexpr(W_VEC_LOAD_PER_THREAD):
                             w_elem_idx = fx.Index(const_expr(wi * BLOCK_M * LDG_VEC)) + fx.Index(tid) * fx.Index(const_expr(LDG_VEC))
@@ -116,6 +136,7 @@ def _compile_implicit_gemm_v6(c_in: int, c_out: int, kv: int, dtype_str: str):
                                 scf.YieldOp([])
                         gpu.barrier()
 
+                        # Compute: accumulate into LDS acc (not global!)
                         thread_if = scf.IfOp(valid_thread, results_=[], has_else=False)
                         with ir.InsertionPoint(thread_if.then_block):
                             lut_idx = fx.Index(bid) * fx.Index(const_expr(KV * BLOCK_M)) + \
@@ -128,8 +149,8 @@ def _compile_implicit_gemm_v6(c_in: int, c_out: int, kv: int, dtype_str: str):
                                 feat_base = fx.Index(inp_row) * fx.Index(const_expr(C_IN))
 
                                 for j in range_constexpr(C_OUT_TILE_VECS):
-                                    out_off = out_row_base + c_out_offset + fx.Index(const_expr(j * OUT_VEC))
-                                    acc = out_.vec_load((out_off,), const_expr(OUT_VEC))
+                                    acc_off = acc_base + fx.Index(const_expr(j * OUT_VEC))
+                                    acc = acc_lds.vec_load((acc_off,), const_expr(OUT_VEC))
 
                                     for c in range_constexpr(C_IN):
                                         f_val = feat_.load(feat_base + fx.Index(const_expr(c)))
@@ -154,12 +175,23 @@ def _compile_implicit_gemm_v6(c_in: int, c_out: int, kv: int, dtype_str: str):
 
                                         acc = arith.addf(acc, arith.mulf(f_bcast, w_f32))
 
-                                    out_.vec_store((out_off,), acc, const_expr(OUT_VEC))
+                                    acc_lds.vec_store((acc_off,), acc, const_expr(OUT_VEC))
 
                                 scf.YieldOp([])
                             scf.YieldOp([])
                         gpu.barrier()
                         scf.YieldOp([])
+
+                # Epilogue: LDS acc → global output for this tile
+                ep_if = scf.IfOp(valid_thread, results_=[], has_else=False)
+                with ir.InsertionPoint(ep_if.then_block):
+                    for j in range_constexpr(C_OUT_TILE_VECS):
+                        acc_off = acc_base + fx.Index(const_expr(j * OUT_VEC))
+                        out_off = out_row_base + c_out_offset + fx.Index(const_expr(j * OUT_VEC))
+                        final_acc = acc_lds.vec_load((acc_off,), const_expr(OUT_VEC))
+                        out_.vec_store((out_off,), final_acc, const_expr(OUT_VEC))
+                    scf.YieldOp([])
+                gpu.barrier()
 
         return kernel
 
@@ -203,7 +235,6 @@ def _pack_weights(filters: torch.Tensor, c_out_tile: int) -> torch.Tensor:
     """Repack filters [kv, C_IN, C_OUT] → [kv, N_TILES, C_IN, C_OUT_TILE] contiguous."""
     kv, c_in, c_out = filters.shape
     n_tiles = c_out // c_out_tile
-    # reshape [kv, C_IN, N_TILES, C_OUT_TILE] then transpose to [kv, N_TILES, C_IN, C_OUT_TILE]
     packed = filters.reshape(kv, c_in, n_tiles, c_out_tile).permute(0, 2, 1, 3).contiguous()
     return packed.reshape(-1)
 
@@ -215,7 +246,7 @@ def implicit_gemm_v6_forward(
     indice_pair_num: torch.Tensor,
     num_activate_out: int,
 ) -> Optional[torch.Tensor]:
-    """V6: output-tiled implicit GEMM with pre-packed weights."""
+    """V6: V5 (LDS acc) + output column tiling."""
     try:
         import flydsl
     except ImportError:
