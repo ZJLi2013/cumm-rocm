@@ -135,13 +135,11 @@ def get_implicit_gemm_candidates(dtype, c_in: int, c_out: int) -> List[ImplicitG
         preferred_names = [
             "mfma_f32_16x16x4f32",
             "mfma_f32_16x16x4f32_n2",
-            "mfma_f32_32x32x2f32",
             "scalar_tile",
         ]
     else:
         preferred_names = [
             "scalar_tile",
-            "mfma_f32_32x32x2f32",
             "mfma_f32_16x16x4f32_n2",
             "mfma_f32_16x16x4f32",
         ]

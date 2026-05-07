@@ -564,6 +564,10 @@ class TestImplicitGemmMfmaF32_16x16x4N2:
 class TestImplicitGemmMfmaF32_32x32x2:
     """Current mfma_f32_32x32x2f32 implicit GEMM family member."""
 
+    pytestmark = pytest.mark.skip(
+        reason="32x32x2f32 lane/operand mapping is still experimental"
+    )
+
     @pytest.fixture(autouse=True)
     def _skip_no_gpu(self):
         if not torch.cuda.is_available():

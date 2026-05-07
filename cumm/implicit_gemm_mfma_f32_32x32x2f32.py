@@ -8,6 +8,7 @@ This is the first 32x32 MFMA candidate:
   - C: VGPR accumulator fragment updated by mfma_f32_32x32x2f32
 """
 import math
+import os
 import warnings
 from typing import Dict, Optional
 
@@ -21,6 +22,7 @@ from cumm.implicit_gemm_common import (
 )
 
 MFMA_F32_32X32X2F32_COMPILED_KERNELS: Dict = {}
+_ENABLE_EXPERIMENTAL_32X32 = "CUMM_ENABLE_EXPERIMENTAL_32X32_MFMA"
 
 
 def _compile_implicit_gemm_mfma_f32_32x32x2f32(
@@ -235,6 +237,9 @@ def implicit_gemm_mfma_f32_32x32x2f32_forward(
     num_activate_out: int,
 ) -> Optional[torch.Tensor]:
     """Run the f32 32x32x2 MFMA implicit GEMM kernel."""
+    if os.environ.get(_ENABLE_EXPERIMENTAL_32X32) != "1":
+        return None
+
     try:
         import flydsl  # noqa: F401
     except ImportError:
