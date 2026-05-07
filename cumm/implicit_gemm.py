@@ -1,72 +1,33 @@
-"""FlyDSL Implicit GEMM — backward-compatible re-export layer.
+"""FlyDSL implicit GEMM kernel family public entry."""
 
-Each version is implemented in its own module:
-  - implicit_gemm_v3.py: Pair-scan kernel
-  - implicit_gemm_v4.py: LUT-based gather
-  - implicit_gemm_v5.py: True K-fused (LDS accumulator)
-  - implicit_gemm_v6.py: Output tile + register accumulator (upcoming)
-
-This file re-exports all public APIs so existing imports continue to work.
-"""
-
-# Common utilities
 from cumm.implicit_gemm_common import (
+    C_OUT_TILE_MAX,
     _get_hip_module,
+    _pack_weights,
     preprocess_pairs,
 )
-
-# V3: pair-scan
-from cumm.implicit_gemm_v3 import (
-    _V3_COMPILED_KERNELS as _COMPILED_KERNELS,
-    _compile_implicit_gemm_v3 as _compile_implicit_gemm,
-    implicit_gemm_v3_forward as implicit_gemm_forward,
+from cumm.implicit_gemm_mfma_f32_16x16x4f32 import (
+    MFMA_F32_16X16X4F32_COMPILED_KERNELS,
+    _compile_implicit_gemm_mfma_f32_16x16x4f32,
+    implicit_gemm_mfma_f32_16x16x4f32_forward,
+)
+from cumm.implicit_gemm_scalar_tile import (
+    SCALAR_TILE_COMPILED_KERNELS,
+    _compile_implicit_gemm_scalar_tile,
+    implicit_gemm_scalar_tile_forward,
 )
 
-# V4: LUT-based gather
-from cumm.implicit_gemm_v4 import (
-    _V4_COMPILED_KERNELS,
-    _compile_implicit_gemm_v4,
-    implicit_gemm_v4_forward,
-)
 
-# V5: K-fused LDS accumulator
-from cumm.implicit_gemm_v5 import (
-    _V5_COMPILED_KERNELS,
-    _compile_implicit_gemm_v5,
-    implicit_gemm_v5_forward,
-)
+def implicit_gemm_forward(*args, **kwargs):
+    """Default implicit GEMM entry.
 
-# V6: Output-tiled (column tiling)
-from cumm.implicit_gemm_v6 import (
-    _V6_COMPILED_KERNELS,
-    _compile_implicit_gemm_v6,
-    implicit_gemm_v6_forward,
-)
+    Keep the conservative scalar family as the default until MFMA dispatch
+    policy is implemented and benchmarked.
+    """
+    return implicit_gemm_scalar_tile_forward(*args, **kwargs)
 
-# V7: register accumulator scalar baseline
-from cumm.implicit_gemm_v7 import (
-    _V7_COMPILED_KERNELS,
-    _compile_implicit_gemm_v7,
-    implicit_gemm_v7_forward,
-)
 
-# V8a: tile-owned scalar baseline (kept for benchmark comparison)
-from cumm.implicit_gemm_v8a import (
-    _V8A_COMPILED_KERNELS,
-    _compile_implicit_gemm_v8a,
-    implicit_gemm_v8a_forward,
-)
-
-# V8b: tile-owned scalar baseline with A/B LDS tiles
-from cumm.implicit_gemm_v8 import (
-    _V8_COMPILED_KERNELS,
-    _compile_implicit_gemm_v8,
-    implicit_gemm_v8_forward,
-)
-
-# V8c: minimal MFMA fragment kernel
-from cumm.implicit_gemm_v8c import (
-    _V8C_COMPILED_KERNELS,
-    _compile_implicit_gemm_v8c,
-    implicit_gemm_v8c_forward,
-)
+IMPLICIT_GEMM_KERNELS = {
+    "scalar_tile": implicit_gemm_scalar_tile_forward,
+    "mfma_f32_16x16x4f32": implicit_gemm_mfma_f32_16x16x4f32_forward,
+}

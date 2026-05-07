@@ -8,6 +8,8 @@ import torch
 
 _HIP_MODULE = None
 
+C_OUT_TILE_MAX = 32
+
 
 def _get_hip_module():
     """JIT compile the HIP indice pairs + mask generation extension."""
@@ -54,6 +56,14 @@ def _ensure_flydsl_path():
         sys.path.insert(0, '/opt/FlyDSL')
 
 
+def _pack_weights(filters: torch.Tensor, c_out_tile: int) -> torch.Tensor:
+    """Repack filters [kv, C_IN, C_OUT] -> [kv, N_TILES, C_IN, C_OUT_TILE]."""
+    kv, c_in, c_out = filters.shape
+    n_tiles = c_out // c_out_tile
+    packed = filters.reshape(kv, c_in, n_tiles, c_out_tile).permute(0, 2, 1, 3).contiguous()
+    return packed.reshape(-1)
+
+
 def _forward_common(
     features: torch.Tensor,
     filters: torch.Tensor,
@@ -65,7 +75,7 @@ def _forward_common(
     compile_fn,
     needs_sorted_arrays: bool = False,
 ):
-    """Common forward logic for V3-V6+.
+    """Common forward logic for legacy implicit GEMM kernels.
 
     Returns output tensor or None on failure.
     """

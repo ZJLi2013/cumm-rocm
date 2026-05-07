@@ -1,4 +1,4 @@
-"""Benchmark: V8a vs V8c implicit GEMM."""
+"""Benchmark current implicit GEMM kernel family."""
 import time
 
 import numpy as np
@@ -71,13 +71,13 @@ def _dtype_str(dtype):
 
 def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
     from cumm.implicit_gemm import (
-        _V8A_COMPILED_KERNELS,
-        _V8C_COMPILED_KERNELS,
+        MFMA_F32_16X16X4F32_COMPILED_KERNELS,
+        SCALAR_TILE_COMPILED_KERNELS,
         _get_hip_module,
-        implicit_gemm_v8a_forward,
-        implicit_gemm_v8c_forward,
+        implicit_gemm_mfma_f32_16x16x4f32_forward,
+        implicit_gemm_scalar_tile_forward,
     )
-    from cumm.implicit_gemm_v6 import _pack_weights
+    from cumm.implicit_gemm_common import _pack_weights
 
     features = torch.randn(n_active, c_in, dtype=dtype, device=device) * 0.1
     filters = torch.randn(kv, c_in, c_out, dtype=dtype, device=device) * 0.1
@@ -99,31 +99,31 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
 
     hip = _get_hip_module()
     dtype_str = _dtype_str(dtype)
-    weights_packed_v8a = _pack_weights(filters, min(64, c_out))
-    weights_packed_v8c = _pack_weights(filters, 16)
+    weights_packed_scalar = _pack_weights(filters, min(64, c_out))
+    weights_packed_mfma = _pack_weights(filters, 16)
     features_c = features.contiguous()
 
-    # V8a baseline
-    impl_v8a = implicit_gemm_v8a_forward(features, filters, ip, ipn, n_active)
-    if impl_v8a is not None:
-        print(f"  V8a max error: {(impl_v8a.float() - ref.float()).abs().max().item():.6f}")
+    # scalar_tile fallback
+    impl_scalar = implicit_gemm_scalar_tile_forward(features, filters, ip, ipn, n_active)
+    if impl_scalar is not None:
+        print(f"  scalar_tile max error: {(impl_scalar.float() - ref.float()).abs().max().item():.6f}")
         bench_fn(
-            lambda: implicit_gemm_v8a_forward(features, filters, ip, ipn, n_active),
-            label="[I] V8a tile-owned scalar full",
+            lambda: implicit_gemm_scalar_tile_forward(features, filters, ip, ipn, n_active),
+            label="[I] scalar_tile full",
         )
-        v8a_key = ("v8a", c_in, c_out, kv, dtype_str)
-        if v8a_key in _V8A_COMPILED_KERNELS and hip is not None:
-            launch_fn, block_m = _V8A_COMPILED_KERNELS[v8a_key]
+        scalar_key = ("scalar_tile", c_in, c_out, kv, dtype_str)
+        if scalar_key in SCALAR_TILE_COMPILED_KERNELS and hip is not None:
+            launch_fn, block_m = SCALAR_TILE_COMPILED_KERNELS[scalar_key]
             num_tiles = (n_active + block_m - 1) // block_m
             _, _, _, mask, _, _, lut = hip.build_implicit_gemm_mask(ip, ipn, n_active, block_m)
             mask_flat = mask.reshape(-1).contiguous()
             lut_flat = lut.reshape(-1).contiguous()
 
-            def v8a_kernel_only():
+            def scalar_kernel_only():
                 out_features = torch.zeros(n_active, c_out, dtype=torch.float32, device=device)
                 launch_fn(
                     features_c,
-                    weights_packed_v8a,
+                    weights_packed_scalar,
                     out_features,
                     lut_flat,
                     mask_flat,
@@ -133,31 +133,31 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
                 )
                 return out_features
 
-            bench_fn(v8a_kernel_only, label="[I.3] V8a Kernel only")
+            bench_fn(scalar_kernel_only, label="[I.3] scalar_tile kernel only")
     else:
-        print("  [WARN] V8a failed, skipping")
+        print("  [WARN] scalar_tile failed, skipping")
 
-    # V8c
-    impl_v8c = implicit_gemm_v8c_forward(features, filters, ip, ipn, n_active)
-    if impl_v8c is not None:
-        print(f"  V8c max error: {(impl_v8c.float() - ref.float()).abs().max().item():.6f}")
+    # mfma_f32_16x16x4f32
+    impl_mfma = implicit_gemm_mfma_f32_16x16x4f32_forward(features, filters, ip, ipn, n_active)
+    if impl_mfma is not None:
+        print(f"  mfma_f32_16x16x4f32 max error: {(impl_mfma.float() - ref.float()).abs().max().item():.6f}")
         bench_fn(
-            lambda: implicit_gemm_v8c_forward(features, filters, ip, ipn, n_active),
-            label="[J] V8c minimal MFMA full",
+            lambda: implicit_gemm_mfma_f32_16x16x4f32_forward(features, filters, ip, ipn, n_active),
+            label="[J] mfma_f32_16x16x4f32 full",
         )
-        v8c_key = ("v8c", c_in, c_out, kv, dtype_str)
-        if v8c_key in _V8C_COMPILED_KERNELS and hip is not None:
-            launch_fn, block_m = _V8C_COMPILED_KERNELS[v8c_key]
+        mfma_key = ("mfma_f32_16x16x4f32", c_in, c_out, kv, dtype_str)
+        if mfma_key in MFMA_F32_16X16X4F32_COMPILED_KERNELS and hip is not None:
+            launch_fn, block_m = MFMA_F32_16X16X4F32_COMPILED_KERNELS[mfma_key]
             num_tiles = (n_active + block_m - 1) // block_m
             _, _, _, mask, _, _, lut = hip.build_implicit_gemm_mask(ip, ipn, n_active, block_m)
             mask_flat = mask.reshape(-1).contiguous()
             lut_flat = lut.reshape(-1).contiguous()
 
-            def v8c_kernel_only():
+            def mfma_kernel_only():
                 out_features = torch.zeros(n_active, c_out, dtype=torch.float32, device=device)
                 launch_fn(
                     features_c,
-                    weights_packed_v8c,
+                    weights_packed_mfma,
                     out_features,
                     lut_flat,
                     mask_flat,
@@ -167,9 +167,9 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
                 )
                 return out_features
 
-            bench_fn(v8c_kernel_only, label="[J.3] V8c Kernel only")
+            bench_fn(mfma_kernel_only, label="[J.3] mfma_f32_16x16x4f32 kernel only")
     else:
-        print("  [WARN] V8c failed, skipping")
+        print("  [WARN] mfma_f32_16x16x4f32 failed, skipping")
 
     if hip is not None:
         bench_fn(

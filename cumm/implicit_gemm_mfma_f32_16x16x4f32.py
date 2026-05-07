@@ -1,4 +1,4 @@
-"""V8c: minimal MFMA implicit GEMM fragment kernel.
+"""mfma_f32_16x16x4f32 implicit GEMM family member.
 
 This version is intentionally narrow:
   - f32 only
@@ -19,13 +19,15 @@ from cumm.implicit_gemm_common import (
     _dtype_to_str,
     _ensure_flydsl_path,
     _get_hip_module,
+    _pack_weights,
 )
-from cumm.implicit_gemm_v6 import _pack_weights
 
-_V8C_COMPILED_KERNELS: Dict = {}
+MFMA_F32_16X16X4F32_COMPILED_KERNELS: Dict = {}
 
 
-def _compile_implicit_gemm_v8c(c_in: int, c_out: int, kv: int, dtype_str: str):
+def _compile_implicit_gemm_mfma_f32_16x16x4f32(
+    c_in: int, c_out: int, kv: int, dtype_str: str
+):
     _ensure_flydsl_path()
 
     import flydsl.compiler as flyc
@@ -39,7 +41,7 @@ def _compile_implicit_gemm_v8c(c_in: int, c_out: int, kv: int, dtype_str: str):
     from kernels.tensor_shim import GTensor, STensor
 
     if dtype_str != "f32":
-        raise ValueError("V8c currently supports f32 only")
+        raise ValueError("mfma_f32_16x16x4f32 currently supports f32 only")
 
     C_IN = c_in
     C_OUT = c_out
@@ -51,7 +53,7 @@ def _compile_implicit_gemm_v8c(c_in: int, c_out: int, kv: int, dtype_str: str):
 
     W_TILE_ELEMS = C_IN * C_OUT_TILE
     W_TILE_BYTES = W_TILE_ELEMS * 4
-    allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig_v8c")
+    allocator = SmemAllocator(None, arch="gfx942", global_sym_name="smem_ig_mfma_f32_16x16x4f32")
     smem_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_w_offset + W_TILE_BYTES
 
@@ -227,14 +229,14 @@ def _compile_implicit_gemm_v8c(c_in: int, c_out: int, kv: int, dtype_str: str):
     return launch_fn, BLOCK_M
 
 
-def implicit_gemm_v8c_forward(
+def implicit_gemm_mfma_f32_16x16x4f32_forward(
     features: torch.Tensor,
     filters: torch.Tensor,
     indice_pairs: torch.Tensor,
     indice_pair_num: torch.Tensor,
     num_activate_out: int,
 ) -> Optional[torch.Tensor]:
-    """V8c: minimal f32 MFMA fragment kernel."""
+    """Run the f32 16x16x4 MFMA implicit GEMM kernel."""
     try:
         import flydsl  # noqa: F401
     except ImportError:
@@ -264,20 +266,23 @@ def implicit_gemm_v8c_forward(
     if sorted_inp.shape[0] == 0:
         return torch.zeros(num_activate_out, c_out, dtype=torch.float32, device=device)
 
-    key = ("v8c", c_in, c_out, kv, dtype_str)
-    if key not in _V8C_COMPILED_KERNELS:
+    key = ("mfma_f32_16x16x4f32", c_in, c_out, kv, dtype_str)
+    if key not in MFMA_F32_16X16X4F32_COMPILED_KERNELS:
         try:
-            launch_fn, block_m = _compile_implicit_gemm_v8c(c_in, c_out, kv, dtype_str)
-            _V8C_COMPILED_KERNELS[key] = (launch_fn, block_m)
+            launch_fn, block_m = _compile_implicit_gemm_mfma_f32_16x16x4f32(
+                c_in, c_out, kv, dtype_str
+            )
+            MFMA_F32_16X16X4F32_COMPILED_KERNELS[key] = (launch_fn, block_m)
         except Exception as e:
             import traceback
 
             warnings.warn(
-                f"Failed to compile V8c implicit GEMM kernel: {e}\n{traceback.format_exc()}"
+                "Failed to compile mfma_f32_16x16x4f32 implicit GEMM "
+                f"kernel: {e}\n{traceback.format_exc()}"
             )
             return None
     else:
-        launch_fn, block_m = _V8C_COMPILED_KERNELS[key]
+        launch_fn, block_m = MFMA_F32_16X16X4F32_COMPILED_KERNELS[key]
 
     c_out_tile = 16
     weights_packed = _pack_weights(filters, c_out_tile)

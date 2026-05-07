@@ -374,124 +374,8 @@ class TestInpRowLut:
         assert lut.shape == (num_tiles, 3, 64)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-class TestImplicitGemmV4:
-    """GPU tests for V4 implicit GEMM kernel (lut-based gather + register blocking)."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_flydsl(self):
-        try:
-            import flydsl
-        except ImportError:
-            pytest.skip("FlyDSL not installed")
-
-    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, dtype):
-        from cumm.implicit_gemm import implicit_gemm_v4_forward
-
-        device = "cuda"
-        features = torch.randn(n_in, c_in, dtype=dtype, device=device) * 0.1
-        filters = torch.randn(kv, c_in, c_out, dtype=dtype, device=device) * 0.1
-        ip, ipn = _make_pairs(kv, nhot_list, n_max=max(nhot_list), device=device)
-        ip[ip < 0] = 0
-        ip[:, 0] = ip[:, 0] % n_in
-        # V4 lut assumes SubM: unique output index per (kv, out_row).
-        # Use unique permutation to avoid duplicates.
-        for k_idx in range(kv):
-            nhot = nhot_list[k_idx]
-            if nhot > 0:
-                perm = torch.randperm(n_out, device=device, dtype=torch.int32)[:nhot]
-                ip[k_idx, 1, :nhot] = perm
-
-        ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = implicit_gemm_v4_forward(features, filters, ip, ipn, n_out)
-        assert out is not None, "V4 kernel compilation failed"
-
-        torch.cuda.synchronize()
-        if dtype == torch.float32:
-            atol, rtol = 1e-3, 1e-3
-        else:
-            atol, rtol = 0.05, 0.05
-        torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
-
-    def test_basic_f32(self):
-        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float32)
-
-    def test_basic_f16(self):
-        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float16)
-
-    def test_single_kv(self):
-        self._run_correctness(200, 200, 32, 64, 1, [150], torch.float32)
-
-    def test_some_empty_kv(self):
-        self._run_correctness(100, 100, 16, 16, 5, [30, 0, 50, 0, 20], torch.float32)
-
-    def test_partial_tile(self):
-        self._run_correctness(50, 50, 16, 16, 1, [7], torch.float32)
-
-    def test_kv27_subm(self):
-        """Typical 3x3x3 SubM config."""
-        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, torch.float32)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-class TestImplicitGemmV5:
-    """GPU tests for V5 implicit GEMM kernel (K-fused + LDS double buffer)."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_flydsl(self):
-        try:
-            import flydsl
-        except ImportError:
-            pytest.skip("FlyDSL not installed")
-
-    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, dtype):
-        from cumm.implicit_gemm import implicit_gemm_v5_forward
-
-        device = "cuda"
-        features = torch.randn(n_in, c_in, dtype=dtype, device=device) * 0.1
-        filters = torch.randn(kv, c_in, c_out, dtype=dtype, device=device) * 0.1
-        ip, ipn = _make_pairs(kv, nhot_list, n_max=max(nhot_list), device=device)
-        ip[ip < 0] = 0
-        ip[:, 0] = ip[:, 0] % n_in
-        for k_idx in range(kv):
-            nhot = nhot_list[k_idx]
-            if nhot > 0:
-                perm = torch.randperm(n_out, device=device, dtype=torch.int32)[:nhot]
-                ip[k_idx, 1, :nhot] = perm
-
-        ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = implicit_gemm_v5_forward(features, filters, ip, ipn, n_out)
-        assert out is not None, "V5 kernel compilation failed"
-
-        torch.cuda.synchronize()
-        if dtype == torch.float32:
-            atol, rtol = 1e-3, 1e-3
-        else:
-            atol, rtol = 0.05, 0.05
-        torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
-
-    def test_basic_f32(self):
-        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float32)
-
-    def test_basic_f16(self):
-        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float16)
-
-    def test_single_kv(self):
-        self._run_correctness(200, 200, 32, 64, 1, [150], torch.float32)
-
-    def test_some_empty_kv(self):
-        self._run_correctness(100, 100, 16, 16, 5, [30, 0, 50, 0, 20], torch.float32)
-
-    def test_large_channel(self):
-        """64→128: the config where V4 was slow."""
-        self._run_correctness(500, 500, 64, 128, 3, [150, 200, 100], torch.float32)
-
-    def test_kv27_subm(self):
-        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, torch.float32)
-
-
-class TestImplicitGemmV6:
-    """V6: output-tiled implicit GEMM (column tiling)."""
+class TestImplicitGemmScalarTile:
+    """Current scalar_tile implicit GEMM family member."""
 
     @pytest.fixture(autouse=True)
     def _skip_no_gpu(self):
@@ -506,7 +390,7 @@ class TestImplicitGemmV6:
             pytest.skip("FlyDSL not installed")
 
     def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, dtype):
-        from cumm.implicit_gemm import implicit_gemm_v6_forward
+        from cumm.implicit_gemm import implicit_gemm_scalar_tile_forward
 
         device = "cuda"
         features = torch.randn(n_in, c_in, dtype=dtype, device=device) * 0.1
@@ -521,137 +405,8 @@ class TestImplicitGemmV6:
                 ip[k_idx, 1, :nhot] = perm
 
         ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = implicit_gemm_v6_forward(features, filters, ip, ipn, n_out)
-        assert out is not None, "V6 kernel compilation failed"
-
-        torch.cuda.synchronize()
-        if dtype == torch.float32:
-            atol, rtol = 1e-3, 1e-3
-        else:
-            atol, rtol = 0.05, 0.05
-        torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
-
-    def test_basic_f32(self):
-        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float32)
-
-    def test_basic_f16(self):
-        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float16)
-
-    def test_single_kv(self):
-        self._run_correctness(200, 200, 32, 64, 1, [150], torch.float32)
-
-    def test_some_empty_kv(self):
-        self._run_correctness(100, 100, 16, 16, 5, [30, 0, 50, 0, 20], torch.float32)
-
-    def test_large_channel(self):
-        """64→128: the key config V6 is designed to handle well."""
-        self._run_correctness(500, 500, 64, 128, 3, [150, 200, 100], torch.float32)
-
-    def test_kv27_subm(self):
-        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, torch.float32)
-
-    def test_large_channel_kv27(self):
-        """64→128 with kv27 — the hardest config for LDS budget."""
-        self._run_correctness(500, 500, 64, 128, 27, [50]*27, torch.float32)
-
-
-class TestImplicitGemmV7:
-    """V7: register accumulator scalar baseline."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_gpu(self):
-        if not torch.cuda.is_available():
-            pytest.skip("No GPU")
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_flydsl(self):
-        try:
-            import flydsl
-        except ImportError:
-            pytest.skip("FlyDSL not installed")
-
-    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, dtype):
-        from cumm.implicit_gemm import implicit_gemm_v7_forward
-
-        device = "cuda"
-        features = torch.randn(n_in, c_in, dtype=dtype, device=device) * 0.1
-        filters = torch.randn(kv, c_in, c_out, dtype=dtype, device=device) * 0.1
-        ip, ipn = _make_pairs(kv, nhot_list, n_max=max(nhot_list), device=device)
-        ip[ip < 0] = 0
-        ip[:, 0] = ip[:, 0] % n_in
-        for k_idx in range(kv):
-            nhot = nhot_list[k_idx]
-            if nhot > 0:
-                perm = torch.randperm(n_out, device=device, dtype=torch.int32)[:nhot]
-                ip[k_idx, 1, :nhot] = perm
-
-        ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = implicit_gemm_v7_forward(features, filters, ip, ipn, n_out)
-        assert out is not None, "V7 kernel compilation failed"
-
-        torch.cuda.synchronize()
-        if dtype == torch.float32:
-            atol, rtol = 1e-3, 1e-3
-        else:
-            atol, rtol = 0.05, 0.05
-        torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
-
-    def test_basic_f32(self):
-        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float32)
-
-    def test_basic_f16(self):
-        self._run_correctness(100, 100, 16, 16, 3, [30, 50, 20], torch.float16)
-
-    def test_single_kv(self):
-        self._run_correctness(200, 200, 32, 64, 1, [150], torch.float32)
-
-    def test_some_empty_kv(self):
-        self._run_correctness(100, 100, 16, 16, 5, [30, 0, 50, 0, 20], torch.float32)
-
-    def test_large_channel(self):
-        self._run_correctness(500, 500, 64, 128, 3, [150, 200, 100], torch.float32)
-
-    def test_kv27_subm(self):
-        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, torch.float32)
-
-    def test_large_channel_kv27(self):
-        """64→128 with kv27 — hardest config for LDS."""
-        self._run_correctness(500, 500, 64, 128, 27, [50]*27, torch.float32)
-
-
-class TestImplicitGemmV8:
-    """V8b: tile-owned scalar baseline with A/B LDS tiles."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_gpu(self):
-        if not torch.cuda.is_available():
-            pytest.skip("No GPU")
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_flydsl(self):
-        try:
-            import flydsl
-        except ImportError:
-            pytest.skip("FlyDSL not installed")
-
-    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, dtype):
-        from cumm.implicit_gemm import implicit_gemm_v8_forward
-
-        device = "cuda"
-        features = torch.randn(n_in, c_in, dtype=dtype, device=device) * 0.1
-        filters = torch.randn(kv, c_in, c_out, dtype=dtype, device=device) * 0.1
-        ip, ipn = _make_pairs(kv, nhot_list, n_max=max(nhot_list), device=device)
-        ip[ip < 0] = 0
-        ip[:, 0] = ip[:, 0] % n_in
-        for k_idx in range(kv):
-            nhot = nhot_list[k_idx]
-            if nhot > 0:
-                perm = torch.randperm(n_out, device=device, dtype=torch.int32)[:nhot]
-                ip[k_idx, 1, :nhot] = perm
-
-        ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = implicit_gemm_v8_forward(features, filters, ip, ipn, n_out)
-        assert out is not None, "V8 kernel compilation failed"
+        out = implicit_gemm_scalar_tile_forward(features, filters, ip, ipn, n_out)
+        assert out is not None, "scalar_tile kernel compilation failed"
 
         torch.cuda.synchronize()
         if dtype == torch.float32:
@@ -682,8 +437,8 @@ class TestImplicitGemmV8:
         self._run_correctness(500, 500, 64, 128, 27, [50]*27, torch.float32)
 
 
-class TestImplicitGemmV8C:
-    """V8c: minimal f32 MFMA fragment kernel."""
+class TestImplicitGemmMfmaF32_16x16x4:
+    """Current mfma_f32_16x16x4f32 implicit GEMM family member."""
 
     @pytest.fixture(autouse=True)
     def _skip_no_gpu(self):
@@ -698,7 +453,7 @@ class TestImplicitGemmV8C:
             pytest.skip("FlyDSL not installed")
 
     def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list):
-        from cumm.implicit_gemm import implicit_gemm_v8c_forward
+        from cumm.implicit_gemm import implicit_gemm_mfma_f32_16x16x4f32_forward
 
         device = "cuda"
         features = torch.randn(n_in, c_in, dtype=torch.float32, device=device) * 0.1
@@ -713,8 +468,8 @@ class TestImplicitGemmV8C:
                 ip[k_idx, 1, :nhot] = perm
 
         ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = implicit_gemm_v8c_forward(features, filters, ip, ipn, n_out)
-        assert out is not None, "V8c kernel compilation failed"
+        out = implicit_gemm_mfma_f32_16x16x4f32_forward(features, filters, ip, ipn, n_out)
+        assert out is not None, "mfma_f32_16x16x4f32 kernel compilation failed"
 
         torch.cuda.synchronize()
         torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
