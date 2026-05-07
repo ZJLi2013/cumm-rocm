@@ -11,6 +11,11 @@ from cumm.implicit_gemm_mfma_f32_16x16x4f32 import (
     _compile_implicit_gemm_mfma_f32_16x16x4f32,
     implicit_gemm_mfma_f32_16x16x4f32_forward,
 )
+from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2 import (
+    MFMA_F32_16X16X4F32_N2_COMPILED_KERNELS,
+    _compile_implicit_gemm_mfma_f32_16x16x4f32_n2,
+    implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
+)
 from cumm.implicit_gemm_scalar_tile import (
     SCALAR_TILE_COMPILED_KERNELS,
     _compile_implicit_gemm_scalar_tile,
@@ -30,4 +35,5 @@ def implicit_gemm_forward(*args, **kwargs):
 IMPLICIT_GEMM_KERNELS = {
     "scalar_tile": implicit_gemm_scalar_tile_forward,
     "mfma_f32_16x16x4f32": implicit_gemm_mfma_f32_16x16x4f32_forward,
+    "mfma_f32_16x16x4f32_n2": implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
 }
