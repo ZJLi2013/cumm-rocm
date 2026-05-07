@@ -26,13 +26,13 @@ echo "=== Install cumm-rocm ==="
 cd /workspace/cumm-rocm
 pip install -e . --quiet
 
-echo "=== Step 1: V8 correctness ==="
-python -m pytest test/test_implicit_gemm.py::TestImplicitGemmV8 -v --tb=long
+echo "=== Step 1: V8c correctness ==="
+python -m pytest test/test_implicit_gemm.py::TestImplicitGemmV8C -v --tb=long
 
-echo "=== Step 2: V7 regression ==="
-python -m pytest test/test_implicit_gemm.py::TestImplicitGemmV7::test_basic_f32 -v --tb=short
+echo "=== Step 2: V8a regression ==="
+python -m pytest test/test_implicit_gemm.py::TestImplicitGemmV8::test_basic_f32 -v --tb=short
 
-echo "=== Step 3: Benchmark (V7 vs V8a vs V8b) ==="
+echo "=== Step 3: Benchmark (V8a vs V8c) ==="
 python test/bench_v8.py
 
 echo "=== Done ==="

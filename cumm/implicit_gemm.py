@@ -63,3 +63,10 @@ from cumm.implicit_gemm_v8 import (
     _compile_implicit_gemm_v8,
     implicit_gemm_v8_forward,
 )
+
+# V8c: minimal MFMA fragment kernel
+from cumm.implicit_gemm_v8c import (
+    _V8C_COMPILED_KERNELS,
+    _compile_implicit_gemm_v8c,
+    implicit_gemm_v8c_forward,
+)

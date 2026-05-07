@@ -1,4 +1,4 @@
-"""Benchmark: V7 vs V8a vs V8b implicit GEMM."""
+"""Benchmark: V8a vs V8c implicit GEMM."""
 import time
 
 import numpy as np
@@ -71,15 +71,13 @@ def _dtype_str(dtype):
 
 def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
     from cumm.implicit_gemm import (
-        _V7_COMPILED_KERNELS,
         _V8A_COMPILED_KERNELS,
-        _V8_COMPILED_KERNELS,
+        _V8C_COMPILED_KERNELS,
         _get_hip_module,
-        implicit_gemm_v7_forward,
         implicit_gemm_v8a_forward,
-        implicit_gemm_v8_forward,
+        implicit_gemm_v8c_forward,
     )
-    from cumm.implicit_gemm_v6 import C_OUT_TILE_MAX, _pack_weights
+    from cumm.implicit_gemm_v6 import _pack_weights
 
     features = torch.randn(n_active, c_in, dtype=dtype, device=device) * 0.1
     filters = torch.randn(kv, c_in, c_out, dtype=dtype, device=device) * 0.1
@@ -101,41 +99,9 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
 
     hip = _get_hip_module()
     dtype_str = _dtype_str(dtype)
-    c_out_tile = min(C_OUT_TILE_MAX, c_out)
-    weights_packed = _pack_weights(filters, c_out_tile)
+    weights_packed_v8a = _pack_weights(filters, min(64, c_out))
+    weights_packed_v8c = _pack_weights(filters, 16)
     features_c = features.contiguous()
-
-    # V7 baseline
-    impl_v7 = implicit_gemm_v7_forward(features, filters, ip, ipn, n_active)
-    if impl_v7 is not None:
-        print(f"  V7 max error: {(impl_v7.float() - ref.float()).abs().max().item():.6f}")
-        bench_fn(
-            lambda: implicit_gemm_v7_forward(features, filters, ip, ipn, n_active),
-            label="[H] V7 register-acc full",
-        )
-        v7_key = ("v7", c_in, c_out, kv, dtype_str)
-        if v7_key in _V7_COMPILED_KERNELS and hip is not None:
-            launch_fn, block_m = _V7_COMPILED_KERNELS[v7_key]
-            num_tiles = (n_active + block_m - 1) // block_m
-            _, _, _, mask, _, _, lut = hip.build_implicit_gemm_mask(ip, ipn, n_active, block_m)
-            mask_flat = mask.reshape(-1).contiguous()
-            lut_flat = lut.reshape(-1).contiguous()
-
-            def v7_kernel_only():
-                out_features = torch.zeros(n_active, c_out, dtype=torch.float32, device=device)
-                launch_fn(
-                    features_c,
-                    weights_packed,
-                    out_features,
-                    lut_flat,
-                    mask_flat,
-                    num_tiles,
-                    n_active,
-                    torch.cuda.current_stream(),
-                )
-                return out_features
-
-            bench_fn(v7_kernel_only, label="[H.3] V7 Kernel only")
 
     # V8a baseline
     impl_v8a = implicit_gemm_v8a_forward(features, filters, ip, ipn, n_active)
@@ -157,7 +123,7 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
                 out_features = torch.zeros(n_active, c_out, dtype=torch.float32, device=device)
                 launch_fn(
                     features_c,
-                    weights_packed,
+                    weights_packed_v8a,
                     out_features,
                     lut_flat,
                     mask_flat,
@@ -171,27 +137,27 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
     else:
         print("  [WARN] V8a failed, skipping")
 
-    # V8b
-    impl_v8 = implicit_gemm_v8_forward(features, filters, ip, ipn, n_active)
-    if impl_v8 is not None:
-        print(f"  V8b max error: {(impl_v8.float() - ref.float()).abs().max().item():.6f}")
+    # V8c
+    impl_v8c = implicit_gemm_v8c_forward(features, filters, ip, ipn, n_active)
+    if impl_v8c is not None:
+        print(f"  V8c max error: {(impl_v8c.float() - ref.float()).abs().max().item():.6f}")
         bench_fn(
-            lambda: implicit_gemm_v8_forward(features, filters, ip, ipn, n_active),
-            label="[J] V8b A/B LDS scalar full",
+            lambda: implicit_gemm_v8c_forward(features, filters, ip, ipn, n_active),
+            label="[J] V8c minimal MFMA full",
         )
-        v8_key = ("v8", c_in, c_out, kv, dtype_str)
-        if v8_key in _V8_COMPILED_KERNELS and hip is not None:
-            launch_fn, block_m = _V8_COMPILED_KERNELS[v8_key]
+        v8c_key = ("v8c", c_in, c_out, kv, dtype_str)
+        if v8c_key in _V8C_COMPILED_KERNELS and hip is not None:
+            launch_fn, block_m = _V8C_COMPILED_KERNELS[v8c_key]
             num_tiles = (n_active + block_m - 1) // block_m
             _, _, _, mask, _, _, lut = hip.build_implicit_gemm_mask(ip, ipn, n_active, block_m)
             mask_flat = mask.reshape(-1).contiguous()
             lut_flat = lut.reshape(-1).contiguous()
 
-            def v8b_kernel_only():
+            def v8c_kernel_only():
                 out_features = torch.zeros(n_active, c_out, dtype=torch.float32, device=device)
                 launch_fn(
                     features_c,
-                    weights_packed,
+                    weights_packed_v8c,
                     out_features,
                     lut_flat,
                     mask_flat,
@@ -201,9 +167,9 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
                 )
                 return out_features
 
-            bench_fn(v8b_kernel_only, label="[J.3] V8b Kernel only")
+            bench_fn(v8c_kernel_only, label="[J.3] V8c Kernel only")
     else:
-        print("  [WARN] V8b failed, skipping")
+        print("  [WARN] V8c failed, skipping")
 
     if hip is not None:
         bench_fn(
