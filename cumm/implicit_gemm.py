@@ -19,6 +19,11 @@ from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2 import (
     _compile_implicit_gemm_mfma_f32_16x16x4f32_n2,
     implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
 )
+from cumm.implicit_gemm_mfma_f32_32x32x2f32 import (
+    MFMA_F32_32X32X2F32_COMPILED_KERNELS,
+    _compile_implicit_gemm_mfma_f32_32x32x2f32,
+    implicit_gemm_mfma_f32_32x32x2f32_forward,
+)
 from cumm.implicit_gemm_scalar_tile import (
     SCALAR_TILE_COMPILED_KERNELS,
     _compile_implicit_gemm_scalar_tile,
@@ -52,6 +57,7 @@ IMPLICIT_GEMM_KERNELS = {
     "scalar_tile": implicit_gemm_scalar_tile_forward,
     "mfma_f32_16x16x4f32": implicit_gemm_mfma_f32_16x16x4f32_forward,
     "mfma_f32_16x16x4f32_n2": implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
+    "mfma_f32_32x32x2f32": implicit_gemm_mfma_f32_32x32x2f32_forward,
 }
 
 
@@ -77,6 +83,17 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         block_n=16,
         mfma_shape="16x16x4f32",
         priority=90,
+    ),
+    ImplicitGemmKernelDesp(
+        name="mfma_f32_32x32x2f32",
+        forward=implicit_gemm_mfma_f32_32x32x2f32_forward,
+        dtype="f32",
+        min_c_in_multiple=2,
+        min_c_out_multiple=32,
+        block_m=32,
+        block_n=32,
+        mfma_shape="32x32x2f32",
+        priority=80,
     ),
     ImplicitGemmKernelDesp(
         name="scalar_tile",

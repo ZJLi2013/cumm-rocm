@@ -73,11 +73,13 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
     from cumm.implicit_gemm import (
         MFMA_F32_16X16X4F32_COMPILED_KERNELS,
         MFMA_F32_16X16X4F32_N2_COMPILED_KERNELS,
+        MFMA_F32_32X32X2F32_COMPILED_KERNELS,
         SCALAR_TILE_COMPILED_KERNELS,
         _get_hip_module,
         implicit_gemm_forward,
         implicit_gemm_mfma_f32_16x16x4f32_forward,
         implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
+        implicit_gemm_mfma_f32_32x32x2f32_forward,
         implicit_gemm_scalar_tile_forward,
         select_implicit_gemm_kernel,
     )
@@ -120,6 +122,7 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
     dtype_str = _dtype_str(dtype)
     weights_packed_scalar = _pack_weights(filters, min(64, c_out))
     weights_packed_mfma = _pack_weights(filters, 16)
+    weights_packed_mfma32 = _pack_weights(filters, 32)
     features_c = features.contiguous()
 
     # scalar_tile fallback
@@ -233,6 +236,50 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
             )
     else:
         print("  [WARN] mfma_f32_16x16x4f32_n2 failed, skipping")
+
+    # mfma_f32_32x32x2f32
+    impl_mfma32 = implicit_gemm_mfma_f32_32x32x2f32_forward(
+        features, filters, ip, ipn, n_active
+    )
+    if impl_mfma32 is not None:
+        print(
+            "  mfma_f32_32x32x2f32 max error: "
+            f"{(impl_mfma32.float() - ref.float()).abs().max().item():.6f}"
+        )
+        bench_fn(
+            lambda: implicit_gemm_mfma_f32_32x32x2f32_forward(
+                features, filters, ip, ipn, n_active
+            ),
+            label="[L] mfma_f32_32x32x2f32 full",
+        )
+        mfma32_key = ("mfma_f32_32x32x2f32", c_in, c_out, kv, dtype_str)
+        if mfma32_key in MFMA_F32_32X32X2F32_COMPILED_KERNELS and hip is not None:
+            launch_fn, block_m = MFMA_F32_32X32X2F32_COMPILED_KERNELS[mfma32_key]
+            num_tiles = (n_active + block_m - 1) // block_m
+            _, _, _, mask, _, _, lut = hip.build_implicit_gemm_mask(ip, ipn, n_active, block_m)
+            mask_flat = mask.reshape(-1).contiguous()
+            lut_flat = lut.reshape(-1).contiguous()
+
+            def mfma32_kernel_only():
+                out_features = torch.zeros(n_active, c_out, dtype=torch.float32, device=device)
+                launch_fn(
+                    features_c,
+                    weights_packed_mfma32,
+                    out_features,
+                    lut_flat,
+                    mask_flat,
+                    num_tiles,
+                    n_active,
+                    torch.cuda.current_stream(),
+                )
+                return out_features
+
+            bench_fn(
+                mfma32_kernel_only,
+                label="[L.3] mfma_f32_32x32x2f32 kernel only",
+            )
+    else:
+        print("  [WARN] mfma_f32_32x32x2f32 failed, skipping")
 
     if hip is not None:
         bench_fn(
