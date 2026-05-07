@@ -42,3 +42,10 @@ from cumm.implicit_gemm_v6 import (
     _compile_implicit_gemm_v6,
     implicit_gemm_v6_forward,
 )
+
+# V7: K-fused double-buffer
+from cumm.implicit_gemm_v7 import (
+    _V7_COMPILED_KERNELS,
+    _compile_implicit_gemm_v7,
+    implicit_gemm_v7_forward,
+)
