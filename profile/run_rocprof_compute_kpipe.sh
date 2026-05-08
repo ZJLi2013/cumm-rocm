@@ -11,6 +11,13 @@ VARIANTS="${VARIANTS:-direct remap}"
 cd "$ROOT"
 mkdir -p "$WORKLOAD_DIR"
 
+if [[ "${INSTALL_ROCPROF_COMPUTE_DEPS:-1}" == "1" ]]; then
+  req="/opt/rocm-7.2.0/libexec/rocprofiler-compute/requirements.txt"
+  if [[ -f "$req" ]]; then
+    python -m pip install -r "$req"
+  fi
+fi
+
 if [[ "${PATCH_FLYDSL:-0}" == "1" ]]; then
 python - <<'PYEOF'
 import urllib.request

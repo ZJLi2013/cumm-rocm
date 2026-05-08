@@ -19,6 +19,9 @@ PATCH_FLYDSL=1 bash profile/run_kpipe_profile_all.sh
 ```
 
 Outputs are written under `/tmp/kpipe_profile` by default.
+`run_rocprof_compute_kpipe.sh` installs
+`/opt/rocm-7.2.0/libexec/rocprofiler-compute/requirements.txt` by default when
+the requirements file exists. Set `INSTALL_ROCPROF_COMPUTE_DEPS=0` to skip this.
 
 ## Individual Steps
 
