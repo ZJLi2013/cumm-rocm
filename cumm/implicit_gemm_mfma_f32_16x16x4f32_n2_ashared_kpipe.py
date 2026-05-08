@@ -90,6 +90,9 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
         allocator.ptr = smem_epi_offset + EPI_STAGE_BYTES
 
     A_LOAD_PER_BLOCK = math.ceil(A_STAGE_ELEMS / BLOCK_THREADS)
+    A_VEC = 4
+    A_VEC_GROUPS = BLOCK_M * (BLOCK_K // A_VEC)
+    A_VEC_LOAD_PER_BLOCK = math.ceil(A_VEC_GROUPS / BLOCK_THREADS)
     W_LOAD_PER_WAVE = math.ceil(W_STAGE_ELEMS / 64)
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
@@ -196,41 +199,87 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                 gpu.barrier()
 
                 for c_block in range_constexpr(0, C_IN, BLOCK_K):
-                    # Stage A[16 x BLOCK_K], reusing the prepared safe row map.
-                    for ai in range_constexpr(A_LOAD_PER_BLOCK):
-                        a_elem_idx = fx.Index(const_expr(ai * BLOCK_THREADS)) + fx.Index(tid)
-                        a_valid = arith.cmpi(
-                            arith.CmpIPredicate.ult,
-                            a_elem_idx,
-                            fx.Index(const_expr(A_STAGE_ELEMS)),
-                        )
-                        a_if = scf.IfOp(a_valid, results_=[], has_else=False)
-                        with ir.InsertionPoint(a_if.then_block):
-                            a_row_idx = a_elem_idx // fx.Index(const_expr(BLOCK_K))
-                            a_k_idx = a_elem_idx % fx.Index(const_expr(BLOCK_K))
-                            a_k_i32 = fx.Int32(arith.index_cast(T.i32, a_k_idx))
-                            c_idx_i32 = a_k_i32 + fx.Int32(const_expr(c_block))
-                            c_valid = arith.cmpi(
-                                arith.CmpIPredicate.slt,
-                                c_idx_i32,
-                                fx.Int32(const_expr(C_IN)),
+                    if const_expr(BLOCK_K == 16 and c_block + BLOCK_K <= C_IN):
+                        # Stage A with vec4 global loads. Sparse rows are irregular,
+                        # but channels within each row are contiguous.
+                        for ai in range_constexpr(A_VEC_LOAD_PER_BLOCK):
+                            a_vec_idx = fx.Index(const_expr(ai * BLOCK_THREADS)) + fx.Index(tid)
+                            a_vec_valid = arith.cmpi(
+                                arith.CmpIPredicate.ult,
+                                a_vec_idx,
+                                fx.Index(const_expr(A_VEC_GROUPS)),
                             )
-                            safe_c_i32 = arith.select(c_valid, c_idx_i32, zero_i32)
-                            safe_row_base = row_lds.load(a_row_idx)
-                            row_valid_i32 = row_lds.load(
-                                fx.Index(const_expr(BLOCK_M)) + a_row_idx
+                            a_vec_if = scf.IfOp(a_vec_valid, results_=[], has_else=False)
+                            with ir.InsertionPoint(a_vec_if.then_block):
+                                a_row_idx = a_vec_idx // fx.Index(const_expr(BLOCK_K // A_VEC))
+                                a_k_vec_idx = a_vec_idx % fx.Index(const_expr(BLOCK_K // A_VEC))
+                                safe_row_base = row_lds.load(a_row_idx)
+                                row_valid_i32 = row_lds.load(
+                                    fx.Index(const_expr(BLOCK_M)) + a_row_idx
+                                )
+                                row_valid = arith.cmpi(
+                                    arith.CmpIPredicate.ne,
+                                    row_valid_i32,
+                                    zero_i32,
+                                )
+                                feat_off = (
+                                    fx.Index(safe_row_base)
+                                    + fx.Index(const_expr(c_block))
+                                    + a_k_vec_idx * fx.Index(const_expr(A_VEC))
+                                )
+                                a_vec = feat_.vec_load((feat_off,), const_expr(A_VEC))
+                                a_lds_base = (
+                                    a_row_idx * fx.Index(const_expr(BLOCK_K))
+                                    + a_k_vec_idx * fx.Index(const_expr(A_VEC))
+                                )
+                                for vi in range_constexpr(A_VEC):
+                                    a_val = vector.extract(
+                                        a_vec,
+                                        static_position=[const_expr(vi)],
+                                        dynamic_position=[],
+                                    )
+                                    a_val = arith.select(row_valid, a_val, zero_f32)
+                                    a_lds.store(
+                                        a_lds_base + fx.Index(const_expr(vi)),
+                                        a_val,
+                                    )
+                                scf.YieldOp([])
+                    else:
+                        # Stage A[16 x BLOCK_K], reusing the prepared safe row map.
+                        for ai in range_constexpr(A_LOAD_PER_BLOCK):
+                            a_elem_idx = fx.Index(const_expr(ai * BLOCK_THREADS)) + fx.Index(tid)
+                            a_valid = arith.cmpi(
+                                arith.CmpIPredicate.ult,
+                                a_elem_idx,
+                                fx.Index(const_expr(A_STAGE_ELEMS)),
                             )
-                            row_valid = arith.cmpi(
-                                arith.CmpIPredicate.ne,
-                                row_valid_i32,
-                                zero_i32,
-                            )
-                            load_a = arith.andi(row_valid, c_valid)
-                            feat_off = fx.Index(safe_row_base) + fx.Index(safe_c_i32)
-                            a_val = feat_.load(feat_off)
-                            a_val = arith.select(load_a, a_val, zero_f32)
-                            a_lds.store(a_elem_idx, a_val)
-                            scf.YieldOp([])
+                            a_if = scf.IfOp(a_valid, results_=[], has_else=False)
+                            with ir.InsertionPoint(a_if.then_block):
+                                a_row_idx = a_elem_idx // fx.Index(const_expr(BLOCK_K))
+                                a_k_idx = a_elem_idx % fx.Index(const_expr(BLOCK_K))
+                                a_k_i32 = fx.Int32(arith.index_cast(T.i32, a_k_idx))
+                                c_idx_i32 = a_k_i32 + fx.Int32(const_expr(c_block))
+                                c_valid = arith.cmpi(
+                                    arith.CmpIPredicate.slt,
+                                    c_idx_i32,
+                                    fx.Int32(const_expr(C_IN)),
+                                )
+                                safe_c_i32 = arith.select(c_valid, c_idx_i32, zero_i32)
+                                safe_row_base = row_lds.load(a_row_idx)
+                                row_valid_i32 = row_lds.load(
+                                    fx.Index(const_expr(BLOCK_M)) + a_row_idx
+                                )
+                                row_valid = arith.cmpi(
+                                    arith.CmpIPredicate.ne,
+                                    row_valid_i32,
+                                    zero_i32,
+                                )
+                                load_a = arith.andi(row_valid, c_valid)
+                                feat_off = fx.Index(safe_row_base) + fx.Index(safe_c_i32)
+                                a_val = feat_.load(feat_off)
+                                a_val = arith.select(load_a, a_val, zero_f32)
+                                a_lds.store(a_elem_idx, a_val)
+                                scf.YieldOp([])
 
                     w_base = fx.Index(
                         const_expr(k * N_C_OUT_TILES * C_IN * C_OUT_TILE)
