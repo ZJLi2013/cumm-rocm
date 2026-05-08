@@ -161,9 +161,9 @@ def get_implicit_gemm_candidates(dtype, c_in: int, c_out: int) -> List[ImplicitG
     # channel bucket. Keep scalar first elsewhere until a candidate proves faster.
     if dtype_str == "f32" and c_in <= 16:
         preferred_names = [
+            "mfma_f32_16x16x4f32_n2_ashared",
             "mfma_f32_16x16x4f32",
             "mfma_f32_16x16x4f32_n2",
-            "mfma_f32_16x16x4f32_n2_ashared",
             "scalar_tile",
         ]
     else:
