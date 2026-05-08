@@ -357,8 +357,9 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
                         )
                         fx.memref_store_vec(new_acc, acc_reg)
 
-                    if const_expr(next_c_block < C_IN):
-                        gpu.barrier()
+                    # Protect the next c_block/kv warmup from overwriting the
+                    # read stage before both waves finish consuming it.
+                    gpu.barrier()
                 scf.YieldOp([])
 
         final_acc = fx.memref_load_vec(acc_reg)
