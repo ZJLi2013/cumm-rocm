@@ -20,6 +20,11 @@ from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2 import (
     _compile_implicit_gemm_mfma_f32_16x16x4f32_n2,
     implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
 )
+from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared import (
+    MFMA_F32_16X16X4F32_N2_ASHARED_COMPILED_KERNELS,
+    _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared,
+    implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_forward,
+)
 from cumm.implicit_gemm_mfma_f32_32x32x2f32 import (
     MFMA_F32_32X32X2F32_COMPILED_KERNELS,
     _compile_implicit_gemm_mfma_f32_32x32x2f32,
@@ -58,6 +63,7 @@ IMPLICIT_GEMM_KERNELS = {
     "scalar_tile": implicit_gemm_scalar_tile_forward,
     "mfma_f32_16x16x4f32": implicit_gemm_mfma_f32_16x16x4f32_forward,
     "mfma_f32_16x16x4f32_n2": implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
+    "mfma_f32_16x16x4f32_n2_ashared": implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_forward,
     "mfma_f32_32x32x2f32": implicit_gemm_mfma_f32_32x32x2f32_forward,
 }
 
@@ -73,6 +79,17 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         block_n=32,
         mfma_shape="16x16x4f32",
         priority=100,
+    ),
+    ImplicitGemmKernelDesp(
+        name="mfma_f32_16x16x4f32_n2_ashared",
+        forward=implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_forward,
+        dtype="f32",
+        min_c_in_multiple=4,
+        min_c_out_multiple=32,
+        block_m=16,
+        block_n=32,
+        mfma_shape="16x16x4f32",
+        priority=95,
     ),
     ImplicitGemmKernelDesp(
         name="mfma_f32_16x16x4f32",
@@ -146,12 +163,14 @@ def get_implicit_gemm_candidates(dtype, c_in: int, c_out: int) -> List[ImplicitG
         preferred_names = [
             "mfma_f32_16x16x4f32",
             "mfma_f32_16x16x4f32_n2",
+            "mfma_f32_16x16x4f32_n2_ashared",
             "scalar_tile",
         ]
     else:
         preferred_names = [
             "scalar_tile",
             "mfma_f32_16x16x4f32_n2",
+            "mfma_f32_16x16x4f32_n2_ashared",
             "mfma_f32_16x16x4f32",
         ]
 
