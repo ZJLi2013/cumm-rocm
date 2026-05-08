@@ -75,6 +75,7 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
         MFMA_F32_16X16X4F32_N2_COMPILED_KERNELS,
         MFMA_F32_16X16X4F32_N2_ASHARED_COMPILED_KERNELS,
         MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS,
+        MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_DB_COMPILED_KERNELS,
         MFMA_F32_32X32X2F32_COMPILED_KERNELS,
         SCALAR_TILE_COMPILED_KERNELS,
         _get_hip_module,
@@ -83,6 +84,8 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
         implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
         implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_forward,
         implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward,
+        implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db32_forward,
+        implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db64_forward,
         implicit_gemm_mfma_f32_32x32x2f32_forward,
         implicit_gemm_scalar_tile_forward,
         select_implicit_gemm_kernel,
@@ -353,6 +356,59 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
             )
     else:
         print("  [WARN] mfma_f32_16x16x4f32_n2_ashared_kpipe failed, skipping")
+
+    for block_k, db_forward in (
+        (32, implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db32_forward),
+        (64, implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db64_forward),
+    ):
+        db_name = f"mfma_f32_16x16x4f32_n2_ashared_kpipe_db{block_k}"
+        impl_db = db_forward(features, filters, ip, ipn, n_active)
+        if impl_db is not None:
+            print(
+                f"  {db_name} max error: "
+                f"{(impl_db.float() - ref.float()).abs().max().item():.6f}"
+            )
+            bench_fn(
+                lambda fn=db_forward: fn(features, filters, ip, ipn, n_active),
+                label=f"[K3-db{block_k}] {db_name} full",
+            )
+            db_key = (db_name, c_in, c_out, kv, dtype_str, block_k)
+            if (
+                db_key in MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_DB_COMPILED_KERNELS
+                and hip is not None
+            ):
+                launch_fn, block_m = (
+                    MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_DB_COMPILED_KERNELS[db_key]
+                )
+                num_tiles = (n_active + block_m - 1) // block_m
+                _, _, _, mask, _, _, lut = hip.build_implicit_gemm_mask(
+                    ip, ipn, n_active, block_m
+                )
+                mask_flat = mask.reshape(-1).contiguous()
+                lut_flat = lut.reshape(-1).contiguous()
+
+                def mfma_n2_ashared_kpipe_db_kernel_only():
+                    out_features = torch.zeros(
+                        n_active, c_out, dtype=torch.float32, device=device
+                    )
+                    launch_fn(
+                        features_c,
+                        weights_packed_mfma,
+                        out_features,
+                        lut_flat,
+                        mask_flat,
+                        num_tiles,
+                        n_active,
+                        torch.cuda.current_stream(),
+                    )
+                    return out_features
+
+                bench_fn(
+                    mfma_n2_ashared_kpipe_db_kernel_only,
+                    label=f"[K3-db{block_k}.3] {db_name} kernel only",
+                )
+        else:
+            print(f"  [WARN] {db_name} failed, skipping")
 
     # mfma_f32_32x32x2f32
     impl_mfma32 = implicit_gemm_mfma_f32_32x32x2f32_forward(
