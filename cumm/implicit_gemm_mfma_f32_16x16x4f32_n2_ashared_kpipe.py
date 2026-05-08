@@ -2,7 +2,7 @@
 
 This keeps the current per-kv BLOCK_K pipeline, but factors sparse A row lookup
 out of the per-element A staging loop:
-  - once per active kv, stage 16 safe input rows + valid flags into LDS
+  - once per active kv, stage 16 safe input row bases + valid flags into LDS
   - each A[16 x BLOCK_K] stage reuses the row map
 
 It is a minimal step toward a reusable sparse A/K stager, not a full iterator
@@ -61,7 +61,7 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
     N_C_OUT_TILE_GROUPS = C_OUT // BLOCK_N
     BLOCK_THREADS = 64 * WAVES_PER_BLOCK
 
-    ROW_MAP_ELEMS = BLOCK_M * 2  # safe_inp_row[16] + row_valid_i32[16]
+    ROW_MAP_ELEMS = BLOCK_M * 2  # safe_row_base[16] + row_valid_i32[16]
     ROW_MAP_BYTES = ROW_MAP_ELEMS * 4
     A_STAGE_ELEMS = BLOCK_M * BLOCK_K
     A_STAGE_BYTES = A_STAGE_ELEMS * 4
@@ -163,7 +163,7 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
             )
             kv_if = scf.IfOp(is_active, results_=[], has_else=False)
             with ir.InsertionPoint(kv_if.then_block):
-                # Prepare sparse A row map once per kv, then reuse it for all c_blocks.
+                # Prepare sparse A row bases once per kv, then reuse them for all c_blocks.
                 row_tid_valid = arith.cmpi(
                     arith.CmpIPredicate.slt,
                     tid,
@@ -186,7 +186,8 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                     row_valid = arith.andi(row_in_bounds, has_pair)
                     safe_inp_row = arith.select(row_valid, inp_row, zero_i32)
                     row_valid_i32 = arith.select(row_valid, one_i32, zero_i32)
-                    row_lds.store(row_idx, safe_inp_row)
+                    safe_row_base = safe_inp_row * fx.Int32(const_expr(C_IN))
+                    row_lds.store(row_idx, safe_row_base)
                     row_lds.store(
                         fx.Index(const_expr(BLOCK_M)) + row_idx,
                         row_valid_i32,
@@ -215,7 +216,7 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                                 fx.Int32(const_expr(C_IN)),
                             )
                             safe_c_i32 = arith.select(c_valid, c_idx_i32, zero_i32)
-                            safe_inp_row = row_lds.load(a_row_idx)
+                            safe_row_base = row_lds.load(a_row_idx)
                             row_valid_i32 = row_lds.load(
                                 fx.Index(const_expr(BLOCK_M)) + a_row_idx
                             )
@@ -225,10 +226,7 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                                 zero_i32,
                             )
                             load_a = arith.andi(row_valid, c_valid)
-                            feat_off = (
-                                fx.Index(safe_inp_row) * fx.Index(const_expr(C_IN))
-                                + fx.Index(safe_c_i32)
-                            )
+                            feat_off = fx.Index(safe_row_base) + fx.Index(safe_c_i32)
                             a_val = feat_.load(feat_off)
                             a_val = arith.select(load_a, a_val, zero_f32)
                             a_lds.store(a_elem_idx, a_val)
