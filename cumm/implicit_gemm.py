@@ -59,8 +59,12 @@ class ImplicitGemmKernelDesp:
     dtype: str
     min_c_in_multiple: int
     min_c_out_multiple: int
-    block_m: int
-    block_n: int
+    tile_m: int
+    tile_n: int
+    block_k: Optional[int]
+    waves: int
+    ashared: bool
+    epilogue: str
     mfma_shape: Optional[str]
     priority: int
 
@@ -70,6 +74,16 @@ class ImplicitGemmKernelDesp:
         if c_in % self.min_c_in_multiple != 0:
             return False
         return c_out % self.min_c_out_multiple == 0
+
+    @property
+    def block_m(self) -> int:
+        """Backward-compatible alias while callers migrate to tile_m."""
+        return self.tile_m
+
+    @property
+    def block_n(self) -> int:
+        """Backward-compatible alias while callers migrate to tile_n."""
+        return self.tile_n
 
 
 IMPLICIT_GEMM_KERNELS = {
@@ -103,8 +117,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="f32",
         min_c_in_multiple=4,
         min_c_out_multiple=32,
-        block_m=16,
-        block_n=32,
+        tile_m=16,
+        tile_n=32,
+        block_k=None,
+        waves=2,
+        ashared=False,
+        epilogue="direct",
         mfma_shape="16x16x4f32",
         priority=100,
     ),
@@ -114,8 +132,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="f32",
         min_c_in_multiple=4,
         min_c_out_multiple=32,
-        block_m=16,
-        block_n=32,
+        tile_m=16,
+        tile_n=32,
+        block_k=None,
+        waves=2,
+        ashared=True,
+        epilogue="direct",
         mfma_shape="16x16x4f32",
         priority=95,
     ),
@@ -125,8 +147,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="f32",
         min_c_in_multiple=4,
         min_c_out_multiple=32,
-        block_m=16,
-        block_n=32,
+        tile_m=16,
+        tile_n=32,
+        block_k=16,
+        waves=2,
+        ashared=True,
+        epilogue="direct",
         mfma_shape="16x16x4f32",
         priority=94,
     ),
@@ -136,8 +162,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="f32",
         min_c_in_multiple=4,
         min_c_out_multiple=32,
-        block_m=16,
-        block_n=32,
+        tile_m=16,
+        tile_n=32,
+        block_k=32,
+        waves=2,
+        ashared=True,
+        epilogue="direct",
         mfma_shape="16x16x4f32",
         priority=93,
     ),
@@ -147,8 +177,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="f32",
         min_c_in_multiple=4,
         min_c_out_multiple=32,
-        block_m=16,
-        block_n=32,
+        tile_m=16,
+        tile_n=32,
+        block_k=32,
+        waves=2,
+        ashared=True,
+        epilogue="direct",
         mfma_shape="16x16x4f32",
         priority=78,
     ),
@@ -158,8 +192,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="f32",
         min_c_in_multiple=4,
         min_c_out_multiple=32,
-        block_m=16,
-        block_n=32,
+        tile_m=16,
+        tile_n=32,
+        block_k=32,
+        waves=2,
+        ashared=True,
+        epilogue="direct",
         mfma_shape="16x16x4f32",
         priority=80,
     ),
@@ -169,8 +207,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="f32",
         min_c_in_multiple=4,
         min_c_out_multiple=32,
-        block_m=16,
-        block_n=32,
+        tile_m=16,
+        tile_n=32,
+        block_k=64,
+        waves=2,
+        ashared=True,
+        epilogue="direct",
         mfma_shape="16x16x4f32",
         priority=79,
     ),
@@ -180,8 +222,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="f32",
         min_c_in_multiple=4,
         min_c_out_multiple=16,
-        block_m=16,
-        block_n=16,
+        tile_m=16,
+        tile_n=16,
+        block_k=None,
+        waves=1,
+        ashared=False,
+        epilogue="direct",
         mfma_shape="16x16x4f32",
         priority=90,
     ),
@@ -191,8 +237,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="f32",
         min_c_in_multiple=2,
         min_c_out_multiple=32,
-        block_m=32,
-        block_n=32,
+        tile_m=32,
+        tile_n=32,
+        block_k=None,
+        waves=1,
+        ashared=False,
+        epilogue="direct",
         mfma_shape="32x32x2f32",
         priority=80,
     ),
@@ -202,8 +252,12 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         dtype="any",
         min_c_in_multiple=1,
         min_c_out_multiple=1,
-        block_m=64,
-        block_n=C_OUT_TILE_MAX,
+        tile_m=64,
+        tile_n=C_OUT_TILE_MAX,
+        block_k=None,
+        waves=1,
+        ashared=False,
+        epilogue="direct",
         mfma_shape=None,
         priority=0,
     ),
@@ -240,14 +294,22 @@ def get_implicit_gemm_candidates(dtype, c_in: int, c_out: int) -> List[ImplicitG
             )
         return [by_name[forced_kernel]]
 
-    # Current benchmark data shows MFMA is only competitive for the smallest
-    # channel bucket. Keep scalar first elsewhere until a candidate proves faster.
     if dtype_str == "f32" and c_in <= 16:
         preferred_names = [
             "mfma_f32_16x16x4f32_n2_ashared",
+            "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16",
             "mfma_f32_16x16x4f32",
             "mfma_f32_16x16x4f32_n2",
             "scalar_tile",
+        ]
+    elif dtype_str == "f32" and c_out % 32 == 0:
+        preferred_names = [
+            "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16",
+            "scalar_tile",
+            "mfma_f32_16x16x4f32_n2_ashared",
+            "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32",
+            "mfma_f32_16x16x4f32",
+            "mfma_f32_16x16x4f32_n2",
         ]
     else:
         preferred_names = [

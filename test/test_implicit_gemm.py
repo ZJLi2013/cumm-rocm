@@ -80,6 +80,39 @@ class TestPreprocessPairs:
         assert np.all(padded == 0), "Padded entries should be zero"
 
 
+class TestImplicitGemmDispatchDescriptors:
+    """CPU-only checks for descriptorized implicit GEMM dispatch metadata."""
+
+    def test_bk16_descriptor_metadata(self):
+        from cumm.implicit_gemm import get_implicit_gemm_candidates
+
+        candidates = get_implicit_gemm_candidates(torch.float32, 32, 32)
+        bk16 = next(
+            desp
+            for desp in candidates
+            if desp.name == "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16"
+        )
+
+        assert bk16.tile_m == 16
+        assert bk16.tile_n == 32
+        assert bk16.block_k == 16
+        assert bk16.waves == 2
+        assert bk16.ashared is True
+        assert bk16.epilogue == "direct"
+
+    def test_dispatch_prefers_bk16_for_mid_channels(self):
+        from cumm.implicit_gemm import select_implicit_gemm_kernel
+
+        selected = select_implicit_gemm_kernel(torch.float32, 32, 32)
+        assert selected.name == "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16"
+
+    def test_dispatch_keeps_ashared_for_small_channels(self):
+        from cumm.implicit_gemm import select_implicit_gemm_kernel
+
+        selected = select_implicit_gemm_kernel(torch.float32, 16, 32)
+        assert selected.name == "mfma_f32_16x16x4f32_n2_ashared"
+
+
 # ---------- Mask generation tests (GPU) ----------
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
