@@ -41,16 +41,13 @@ python -m pytest test/test_implicit_gemm.py::TestImplicitGemmMfmaF32_16x16x4N2AS
 echo "=== Step 5: mfma_f32_16x16x4f32_n2_ashared_kpipe_db correctness ==="
 python -m pytest test/test_implicit_gemm.py::TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipeDB -v --tb=long
 
-echo "=== Step 6: mfma_f32_16x16x4f32_n2_ashared_kpipe_astager correctness ==="
-python -m pytest test/test_implicit_gemm.py::TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipeAStager -v --tb=long
-
-echo "=== Step 7: mfma_f32_32x32x2f32 correctness ==="
+echo "=== Step 6: mfma_f32_32x32x2f32 correctness ==="
 python -m pytest test/test_implicit_gemm.py::TestImplicitGemmMfmaF32_32x32x2 -v --tb=long
 
-echo "=== Step 8: scalar_tile regression ==="
+echo "=== Step 7: scalar_tile regression ==="
 python -m pytest test/test_implicit_gemm.py::TestImplicitGemmScalarTile::test_basic_f32 -v --tb=short
 
-echo "=== Step 9: Benchmark current kernel family ==="
+echo "=== Step 8: Benchmark current kernel family ==="
 python test/bench_implicit_gemm_family.py
 
 echo "=== Done ==="

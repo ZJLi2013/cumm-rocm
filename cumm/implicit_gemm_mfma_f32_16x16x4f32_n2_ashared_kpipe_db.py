@@ -57,6 +57,8 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
     BLOCK_THREADS = 64 * WAVES_PER_BLOCK
     LDS_STAGES = 2
 
+    ROW_MAP_ELEMS = BLOCK_M * 2  # safe_inp_row[16] + row_valid_i32[16]
+    ROW_MAP_BYTES = ROW_MAP_ELEMS * 4
     A_STAGE_ELEMS = BLOCK_M * BLOCK_K
     A_STAGE_BYTES = A_STAGE_ELEMS * 4
     W_STAGE_ELEMS = BLOCK_K * C_OUT_TILE
@@ -70,6 +72,8 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
         arch="gfx942",
         global_sym_name=f"smem_ig_mfma_f32_16x16x4f32_n2_ashared_kpipe_db{BLOCK_K}",
     )
+    smem_row_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = smem_row_offset + ROW_MAP_BYTES
     smem_a_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_a_offset + A_STAGE_BYTES * LDS_STAGES
     smem_w_offset = allocator._align(allocator.ptr, 16)
@@ -97,6 +101,8 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
         mask_ = GTensor(mask, dtype=T.i32, shape=(-1,))
 
         base_ptr = allocator.get_base()
+        smem_row_ptr = SmemPtr(base_ptr, smem_row_offset, T.i32, shape=(ROW_MAP_ELEMS,))
+        row_lds = STensor(smem_row_ptr, T.i32, shape=(ROW_MAP_ELEMS,))
         smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, T.f32, shape=(A_TOTAL_ELEMS,))
         a_lds = STensor(smem_a_ptr, T.f32, shape=(A_TOTAL_ELEMS,))
         smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, T.f32, shape=(W_TOTAL_ELEMS,))
@@ -117,6 +123,8 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
         c_row_vec_base = (lane // fx.Int32(const_expr(16))) * fx.Int32(const_expr(4))
 
         zero_f32 = arith.constant(0.0, type=T.f32)
+        zero_i32 = fx.Int32(arith.constant(0, type=T.i32))
+        one_i32 = fx.Int32(arith.constant(1, type=T.i32))
         zero_acc = arith.constant_vector(0.0, T.vec(4, T.f32))
 
         acc_reg_ty = fx.MemRefType.get(
@@ -137,6 +145,37 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
             )
             kv_if = scf.IfOp(is_active, results_=[], has_else=False)
             with ir.InsertionPoint(kv_if.then_block):
+                # Stage sparse A row metadata once per kv, then reuse it for all K blocks.
+                row_tid_valid = arith.cmpi(
+                    arith.CmpIPredicate.slt,
+                    tid,
+                    fx.Int32(const_expr(BLOCK_M)),
+                )
+                row_if = scf.IfOp(row_tid_valid, results_=[], has_else=False)
+                with ir.InsertionPoint(row_if.then_block):
+                    row_idx = fx.Index(tid)
+                    lut_idx = (
+                        fx.Index(m_tile) * fx.Index(const_expr(KV * BLOCK_M))
+                        + fx.Index(const_expr(k * BLOCK_M))
+                        + row_idx
+                    )
+                    inp_row = lut_.load(lut_idx)
+                    out_row = row_tile_base + tid
+                    row_in_bounds = arith.cmpi(
+                        arith.CmpIPredicate.slt, out_row, num_act_out_val
+                    )
+                    has_pair = arith.cmpi(arith.CmpIPredicate.sge, inp_row, zero_i32)
+                    row_valid = arith.andi(row_in_bounds, has_pair)
+                    safe_inp_row = arith.select(row_valid, inp_row, zero_i32)
+                    row_valid_i32 = arith.select(row_valid, one_i32, zero_i32)
+                    row_lds.store(row_idx, safe_inp_row)
+                    row_lds.store(
+                        fx.Index(const_expr(BLOCK_M)) + row_idx,
+                        row_valid_i32,
+                    )
+                    scf.YieldOp([])
+                gpu.barrier()
+
                 for c_block in range_constexpr(0, C_IN, BLOCK_K):
                     if const_expr(c_block == 0):
                         # Warm up stage 0 before the first compute stage.
@@ -151,7 +190,6 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
                             with ir.InsertionPoint(a_if.then_block):
                                 a_row_idx = a_elem_idx // fx.Index(const_expr(BLOCK_K))
                                 a_k_idx = a_elem_idx % fx.Index(const_expr(BLOCK_K))
-                                a_row_i32 = fx.Int32(arith.index_cast(T.i32, a_row_idx))
                                 a_k_i32 = fx.Int32(arith.index_cast(T.i32, a_k_idx))
                                 c_idx_i32 = a_k_i32 + fx.Int32(const_expr(c_block))
                                 c_valid = arith.cmpi(
@@ -162,29 +200,16 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
                                 safe_c_i32 = arith.select(
                                     c_valid,
                                     c_idx_i32,
-                                    fx.Int32(arith.constant(0, type=T.i32)),
+                                    zero_i32,
                                 )
-                                lut_idx = (
-                                    fx.Index(m_tile) * fx.Index(const_expr(KV * BLOCK_M))
-                                    + fx.Index(const_expr(k * BLOCK_M))
-                                    + a_row_idx
+                                safe_inp_row = row_lds.load(a_row_idx)
+                                row_valid_i32 = row_lds.load(
+                                    fx.Index(const_expr(BLOCK_M)) + a_row_idx
                                 )
-                                inp_row = lut_.load(lut_idx)
-                                out_row = row_tile_base + a_row_i32
-                                row_in_bounds = arith.cmpi(
-                                    arith.CmpIPredicate.slt, out_row, num_act_out_val
+                                row_valid = arith.cmpi(
+                                    arith.CmpIPredicate.ne, row_valid_i32, zero_i32
                                 )
-                                has_pair = arith.cmpi(
-                                    arith.CmpIPredicate.sge,
-                                    inp_row,
-                                    fx.Int32(arith.constant(0, type=T.i32)),
-                                )
-                                load_a = arith.andi(arith.andi(row_in_bounds, has_pair), c_valid)
-                                safe_inp_row = arith.select(
-                                    load_a,
-                                    inp_row,
-                                    fx.Int32(arith.constant(0, type=T.i32)),
-                                )
+                                load_a = arith.andi(row_valid, c_valid)
                                 feat_off = (
                                     fx.Index(safe_inp_row) * fx.Index(const_expr(C_IN))
                                     + fx.Index(safe_c_i32)
@@ -248,7 +273,6 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
                             with ir.InsertionPoint(a_if.then_block):
                                 a_row_idx = a_elem_idx // fx.Index(const_expr(BLOCK_K))
                                 a_k_idx = a_elem_idx % fx.Index(const_expr(BLOCK_K))
-                                a_row_i32 = fx.Int32(arith.index_cast(T.i32, a_row_idx))
                                 a_k_i32 = fx.Int32(arith.index_cast(T.i32, a_k_idx))
                                 c_idx_i32 = a_k_i32 + fx.Int32(const_expr(next_c_block))
                                 c_valid = arith.cmpi(
@@ -259,29 +283,16 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db(
                                 safe_c_i32 = arith.select(
                                     c_valid,
                                     c_idx_i32,
-                                    fx.Int32(arith.constant(0, type=T.i32)),
+                                    zero_i32,
                                 )
-                                lut_idx = (
-                                    fx.Index(m_tile) * fx.Index(const_expr(KV * BLOCK_M))
-                                    + fx.Index(const_expr(k * BLOCK_M))
-                                    + a_row_idx
+                                safe_inp_row = row_lds.load(a_row_idx)
+                                row_valid_i32 = row_lds.load(
+                                    fx.Index(const_expr(BLOCK_M)) + a_row_idx
                                 )
-                                inp_row = lut_.load(lut_idx)
-                                out_row = row_tile_base + a_row_i32
-                                row_in_bounds = arith.cmpi(
-                                    arith.CmpIPredicate.slt, out_row, num_act_out_val
+                                row_valid = arith.cmpi(
+                                    arith.CmpIPredicate.ne, row_valid_i32, zero_i32
                                 )
-                                has_pair = arith.cmpi(
-                                    arith.CmpIPredicate.sge,
-                                    inp_row,
-                                    fx.Int32(arith.constant(0, type=T.i32)),
-                                )
-                                load_a = arith.andi(arith.andi(row_in_bounds, has_pair), c_valid)
-                                safe_inp_row = arith.select(
-                                    load_a,
-                                    inp_row,
-                                    fx.Int32(arith.constant(0, type=T.i32)),
-                                )
+                                load_a = arith.andi(row_valid, c_valid)
                                 feat_off = (
                                     fx.Index(safe_inp_row) * fx.Index(const_expr(C_IN))
                                     + fx.Index(safe_c_i32)

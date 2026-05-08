@@ -351,7 +351,7 @@ def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_astager_forward(
     if sorted_inp.shape[0] == 0:
         return torch.zeros(num_activate_out, c_out, dtype=torch.float32, device=device)
 
-    key = ("mfma_f32_16x16x4f32_n2_ashared_kpipe_astager", c_in, c_out, kv, dtype_str)
+    key = ("mfma_f32_16x16x4f32_n2_ashared_kpipe", c_in, c_out, kv, dtype_str)
     if key not in MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_ASTAGER_COMPILED_KERNELS:
         try:
             launch_fn, block_m = _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_astager(
