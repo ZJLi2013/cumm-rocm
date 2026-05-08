@@ -687,6 +687,62 @@ class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipe:
         self._run_correctness(500, 500, 64, 128, 27, [50]*27)
 
 
+class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipeAStager:
+    """AStager-thinned kpipe family member."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_no_gpu(self):
+        if not torch.cuda.is_available():
+            pytest.skip("No GPU")
+
+    @pytest.fixture(autouse=True)
+    def _skip_no_flydsl(self):
+        try:
+            import flydsl
+        except ImportError:
+            pytest.skip("FlyDSL not installed")
+
+    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list):
+        from cumm.implicit_gemm import (
+            implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_astager_forward,
+        )
+
+        device = "cuda"
+        features = torch.randn(n_in, c_in, dtype=torch.float32, device=device) * 0.1
+        filters = torch.randn(kv, c_in, c_out, dtype=torch.float32, device=device) * 0.1
+        ip, ipn = _make_pairs(kv, nhot_list, n_max=max(nhot_list), device=device)
+        ip[ip < 0] = 0
+        ip[:, 0] = ip[:, 0] % n_in
+        for k_idx in range(kv):
+            nhot = nhot_list[k_idx]
+            if nhot > 0:
+                perm = torch.randperm(n_out, device=device, dtype=torch.int32)[:nhot]
+                ip[k_idx, 1, :nhot] = perm
+
+        ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
+        out = implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_astager_forward(
+            features, filters, ip, ipn, n_out
+        )
+        assert out is not None, (
+            "mfma_f32_16x16x4f32_n2_ashared_kpipe_astager compilation failed"
+        )
+
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
+
+    def test_basic_f32(self):
+        self._run_correctness(100, 100, 16, 32, 3, [30, 50, 20])
+
+    def test_single_kv(self):
+        self._run_correctness(200, 200, 32, 64, 1, [150])
+
+    def test_kv27_subm(self):
+        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27)
+
+    def test_large_channel_kv27(self):
+        self._run_correctness(500, 500, 64, 128, 27, [50]*27)
+
+
 class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipeDB:
     """Double-buffered kpipe family members."""
 
