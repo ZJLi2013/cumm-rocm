@@ -94,6 +94,9 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
     A_VEC_GROUPS = BLOCK_M * (BLOCK_K // A_VEC)
     A_VEC_LOAD_PER_BLOCK = math.ceil(A_VEC_GROUPS / BLOCK_THREADS)
     W_LOAD_PER_WAVE = math.ceil(W_STAGE_ELEMS / 64)
+    W_VEC = 4
+    W_VEC_GROUPS = BLOCK_K * (C_OUT_TILE // W_VEC)
+    W_VEC_LOAD_PER_WAVE = math.ceil(W_VEC_GROUPS / 64)
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
@@ -284,34 +287,66 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                     w_base = fx.Index(
                         const_expr(k * N_C_OUT_TILES * C_IN * C_OUT_TILE)
                     ) + fx.Index(ct) * fx.Index(const_expr(C_IN * C_OUT_TILE))
-                    for wi in range_constexpr(W_LOAD_PER_WAVE):
-                        w_elem_idx = fx.Index(const_expr(wi * 64)) + fx.Index(lane)
-                        w_valid = arith.cmpi(
-                            arith.CmpIPredicate.ult,
-                            w_elem_idx,
-                            fx.Index(const_expr(W_STAGE_ELEMS)),
-                        )
-                        w_if = scf.IfOp(w_valid, results_=[], has_else=False)
-                        with ir.InsertionPoint(w_if.then_block):
-                            w_k_idx = w_elem_idx // fx.Index(const_expr(C_OUT_TILE))
-                            w_col_idx = w_elem_idx % fx.Index(const_expr(C_OUT_TILE))
-                            w_k_i32 = fx.Int32(arith.index_cast(T.i32, w_k_idx))
-                            c_idx_i32 = w_k_i32 + fx.Int32(const_expr(c_block))
-                            c_valid = arith.cmpi(
-                                arith.CmpIPredicate.slt,
-                                c_idx_i32,
-                                fx.Int32(const_expr(C_IN)),
+                    if const_expr(BLOCK_K == 16 and c_block + BLOCK_K <= C_IN and C_OUT_TILE % W_VEC == 0):
+                        for wi in range_constexpr(W_VEC_LOAD_PER_WAVE):
+                            w_vec_idx = fx.Index(const_expr(wi * 64)) + fx.Index(lane)
+                            w_vec_valid = arith.cmpi(
+                                arith.CmpIPredicate.ult,
+                                w_vec_idx,
+                                fx.Index(const_expr(W_VEC_GROUPS)),
                             )
-                            safe_c_i32 = arith.select(c_valid, c_idx_i32, zero_i32)
-                            w_src = (
-                                w_base
-                                + fx.Index(safe_c_i32) * fx.Index(const_expr(C_OUT_TILE))
-                                + w_col_idx
+                            w_vec_if = scf.IfOp(w_vec_valid, results_=[], has_else=False)
+                            with ir.InsertionPoint(w_vec_if.then_block):
+                                w_k_idx = w_vec_idx // fx.Index(const_expr(C_OUT_TILE // W_VEC))
+                                w_col_vec = w_vec_idx % fx.Index(const_expr(C_OUT_TILE // W_VEC))
+                                w_src = (
+                                    w_base
+                                    + (fx.Index(const_expr(c_block)) + w_k_idx) * fx.Index(const_expr(C_OUT_TILE))
+                                    + w_col_vec * fx.Index(const_expr(W_VEC))
+                                )
+                                w_vec = wp_.vec_load((w_src,), const_expr(W_VEC))
+                                w_lds_base = (
+                                    wave_w_offset
+                                    + w_k_idx * fx.Index(const_expr(C_OUT_TILE))
+                                    + w_col_vec * fx.Index(const_expr(W_VEC))
+                                )
+                                for vi in range_constexpr(W_VEC):
+                                    w_val = vector.extract(
+                                        w_vec,
+                                        static_position=[const_expr(vi)],
+                                        dynamic_position=[],
+                                    )
+                                    w_lds.store(w_lds_base + fx.Index(const_expr(vi)), w_val)
+                                scf.YieldOp([])
+                    else:
+                        for wi in range_constexpr(W_LOAD_PER_WAVE):
+                            w_elem_idx = fx.Index(const_expr(wi * 64)) + fx.Index(lane)
+                            w_valid = arith.cmpi(
+                                arith.CmpIPredicate.ult,
+                                w_elem_idx,
+                                fx.Index(const_expr(W_STAGE_ELEMS)),
                             )
-                            b_val = wp_.load(w_src)
-                            b_val = arith.select(c_valid, b_val, zero_f32)
-                            w_lds.store(wave_w_offset + w_elem_idx, b_val)
-                            scf.YieldOp([])
+                            w_if = scf.IfOp(w_valid, results_=[], has_else=False)
+                            with ir.InsertionPoint(w_if.then_block):
+                                w_k_idx = w_elem_idx // fx.Index(const_expr(C_OUT_TILE))
+                                w_col_idx = w_elem_idx % fx.Index(const_expr(C_OUT_TILE))
+                                w_k_i32 = fx.Int32(arith.index_cast(T.i32, w_k_idx))
+                                c_idx_i32 = w_k_i32 + fx.Int32(const_expr(c_block))
+                                c_valid = arith.cmpi(
+                                    arith.CmpIPredicate.slt,
+                                    c_idx_i32,
+                                    fx.Int32(const_expr(C_IN)),
+                                )
+                                safe_c_i32 = arith.select(c_valid, c_idx_i32, zero_i32)
+                                w_src = (
+                                    w_base
+                                    + fx.Index(safe_c_i32) * fx.Index(const_expr(C_OUT_TILE))
+                                    + w_col_idx
+                                )
+                                b_val = wp_.load(w_src)
+                                b_val = arith.select(c_valid, b_val, zero_f32)
+                                w_lds.store(wave_w_offset + w_elem_idx, b_val)
+                                scf.YieldOp([])
                     gpu.barrier()
 
                     for kk in range_constexpr(0, BLOCK_K, 4):
