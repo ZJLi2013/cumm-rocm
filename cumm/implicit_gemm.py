@@ -28,6 +28,8 @@ from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared import (
 from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe import (
     MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS,
     _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe,
+    implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward,
+    implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward,
     implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward,
 )
 from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db import (
@@ -78,6 +80,12 @@ IMPLICIT_GEMM_KERNELS = {
     "mfma_f32_16x16x4f32_n2_ashared_kpipe": (
         implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward
     ),
+    "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16": (
+        implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward
+    ),
+    "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32": (
+        implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward
+    ),
     "mfma_f32_16x16x4f32_n2_ashared_kpipe_db32": (
         implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db32_forward
     ),
@@ -112,6 +120,28 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         priority=95,
     ),
     ImplicitGemmKernelDesp(
+        name="mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16",
+        forward=implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward,
+        dtype="f32",
+        min_c_in_multiple=4,
+        min_c_out_multiple=32,
+        block_m=16,
+        block_n=32,
+        mfma_shape="16x16x4f32",
+        priority=94,
+    ),
+    ImplicitGemmKernelDesp(
+        name="mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32",
+        forward=implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward,
+        dtype="f32",
+        min_c_in_multiple=4,
+        min_c_out_multiple=32,
+        block_m=16,
+        block_n=32,
+        mfma_shape="16x16x4f32",
+        priority=93,
+    ),
+    ImplicitGemmKernelDesp(
         name="mfma_f32_16x16x4f32_n2_ashared_kpipe",
         forward=implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward,
         dtype="f32",
@@ -120,7 +150,7 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         block_m=16,
         block_n=32,
         mfma_shape="16x16x4f32",
-        priority=94,
+        priority=78,
     ),
     ImplicitGemmKernelDesp(
         name="mfma_f32_16x16x4f32_n2_ashared_kpipe_db32",
@@ -131,7 +161,7 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         block_m=16,
         block_n=32,
         mfma_shape="16x16x4f32",
-        priority=93,
+        priority=80,
     ),
     ImplicitGemmKernelDesp(
         name="mfma_f32_16x16x4f32_n2_ashared_kpipe_db64",
@@ -142,7 +172,7 @@ IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
         block_m=16,
         block_n=32,
         mfma_shape="16x16x4f32",
-        priority=92,
+        priority=79,
     ),
     ImplicitGemmKernelDesp(
         name="mfma_f32_16x16x4f32",

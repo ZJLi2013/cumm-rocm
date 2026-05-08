@@ -634,7 +634,7 @@ class TestImplicitGemmMfmaF32_16x16x4N2AShared:
 
 
 class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipe:
-    """Current mfma_f32_16x16x4f32_n2_ashared_kpipe family member."""
+    """Current K-pipe BLOCK_K family members."""
 
     @pytest.fixture(autouse=True)
     def _skip_no_gpu(self):
@@ -648,10 +648,8 @@ class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipe:
         except ImportError:
             pytest.skip("FlyDSL not installed")
 
-    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list):
-        from cumm.implicit_gemm import (
-            implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward,
-        )
+    def _run_correctness(self, fn_name, n_in, n_out, c_in, c_out, kv, nhot_list):
+        import cumm.implicit_gemm as ig
 
         device = "cuda"
         features = torch.randn(n_in, c_in, dtype=torch.float32, device=device) * 0.1
@@ -666,25 +664,51 @@ class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipe:
                 ip[k_idx, 1, :nhot] = perm
 
         ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
-            features, filters, ip, ipn, n_out
-        )
-        assert out is not None, "mfma_f32_16x16x4f32_n2_ashared_kpipe compilation failed"
+        out = getattr(ig, fn_name)(features, filters, ip, ipn, n_out)
+        assert out is not None, f"{fn_name} compilation failed"
 
         torch.cuda.synchronize()
         torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
 
-    def test_basic_f32(self):
-        self._run_correctness(100, 100, 16, 32, 3, [30, 50, 20])
+    @pytest.mark.parametrize(
+        "fn_name",
+        [
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
+        ],
+    )
+    def test_basic_f32(self, fn_name):
+        self._run_correctness(fn_name, 100, 100, 16, 32, 3, [30, 50, 20])
 
-    def test_single_kv(self):
-        self._run_correctness(200, 200, 32, 64, 1, [150])
+    @pytest.mark.parametrize(
+        "fn_name",
+        [
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
+        ],
+    )
+    def test_single_kv(self, fn_name):
+        self._run_correctness(fn_name, 200, 200, 32, 64, 1, [150])
 
-    def test_kv27_subm(self):
-        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27)
+    @pytest.mark.parametrize(
+        "fn_name",
+        [
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
+        ],
+    )
+    def test_kv27_subm(self, fn_name):
+        self._run_correctness(fn_name, 1000, 1000, 32, 32, 27, [100]*27)
 
-    def test_large_channel_kv27(self):
-        self._run_correctness(500, 500, 64, 128, 27, [50]*27)
+    @pytest.mark.parametrize(
+        "fn_name",
+        [
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
+        ],
+    )
+    def test_large_channel_kv27(self, fn_name):
+        self._run_correctness(fn_name, 500, 500, 64, 128, 27, [50]*27)
 
 
 class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipeDB:

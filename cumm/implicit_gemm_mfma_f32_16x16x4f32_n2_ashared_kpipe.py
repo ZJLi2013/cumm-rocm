@@ -26,7 +26,7 @@ MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS: Dict = {}
 
 
 def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
-    c_in: int, c_out: int, kv: int, dtype_str: str
+    c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int
 ):
     _ensure_flydsl_path()
 
@@ -42,12 +42,14 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
 
     if dtype_str != "f32":
         raise ValueError("mfma_f32_16x16x4f32_n2_ashared_kpipe supports f32 only")
+    if block_k not in (16, 32):
+        raise ValueError(f"unsupported block_k={block_k}, expected 16 or 32")
 
     C_IN = c_in
     C_OUT = c_out
     KV = kv
     BLOCK_M = 16
-    BLOCK_K = 32
+    BLOCK_K = block_k
     C_OUT_TILE = 16
     WAVES_PER_BLOCK = 2
     BLOCK_N = C_OUT_TILE * WAVES_PER_BLOCK
@@ -66,7 +68,7 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
     allocator = SmemAllocator(
         None,
         arch="gfx942",
-        global_sym_name="smem_ig_mfma_f32_16x16x4f32_n2_ashared_kpipe",
+        global_sym_name=f"smem_ig_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{BLOCK_K}",
     )
     smem_row_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_row_offset + ROW_MAP_BYTES
@@ -315,12 +317,13 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
     return launch_fn, BLOCK_M
 
 
-def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
+def _implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
     features: torch.Tensor,
     filters: torch.Tensor,
     indice_pairs: torch.Tensor,
     indice_pair_num: torch.Tensor,
     num_activate_out: int,
+    block_k: int,
 ) -> Optional[torch.Tensor]:
     """Run the f32 16x16x4 MFMA N2 A-shared K-pipe kernel."""
     try:
@@ -352,11 +355,12 @@ def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
     if sorted_inp.shape[0] == 0:
         return torch.zeros(num_activate_out, c_out, dtype=torch.float32, device=device)
 
-    key = ("mfma_f32_16x16x4f32_n2_ashared_kpipe", c_in, c_out, kv, dtype_str)
+    name = f"mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{block_k}"
+    key = (name, c_in, c_out, kv, dtype_str, block_k)
     if key not in MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS:
         try:
             launch_fn, block_m = _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
-                c_in, c_out, kv, dtype_str
+                c_in, c_out, kv, dtype_str, block_k
             )
             MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS[key] = (
                 launch_fn,
@@ -390,3 +394,42 @@ def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
         stream,
     )
     return out_features
+
+
+def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward(
+    features: torch.Tensor,
+    filters: torch.Tensor,
+    indice_pairs: torch.Tensor,
+    indice_pair_num: torch.Tensor,
+    num_activate_out: int,
+) -> Optional[torch.Tensor]:
+    """Run the f32 16x16x4 MFMA N2 A-shared K-pipe BK16 kernel."""
+    return _implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
+        features, filters, indice_pairs, indice_pair_num, num_activate_out, 16
+    )
+
+
+def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward(
+    features: torch.Tensor,
+    filters: torch.Tensor,
+    indice_pairs: torch.Tensor,
+    indice_pair_num: torch.Tensor,
+    num_activate_out: int,
+) -> Optional[torch.Tensor]:
+    """Run the f32 16x16x4 MFMA N2 A-shared K-pipe BK32 kernel."""
+    return _implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
+        features, filters, indice_pairs, indice_pair_num, num_activate_out, 32
+    )
+
+
+def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
+    features: torch.Tensor,
+    filters: torch.Tensor,
+    indice_pairs: torch.Tensor,
+    indice_pair_num: torch.Tensor,
+    num_activate_out: int,
+) -> Optional[torch.Tensor]:
+    """Compatibility alias for the BK32 K-pipe kernel."""
+    return implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward(
+        features, filters, indice_pairs, indice_pair_num, num_activate_out
+    )
