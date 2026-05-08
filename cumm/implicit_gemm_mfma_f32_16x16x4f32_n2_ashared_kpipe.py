@@ -26,7 +26,7 @@ MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS: Dict = {}
 
 
 def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
-    c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int
+    c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int, epilogue: str = "direct"
 ):
     _ensure_flydsl_path()
 
@@ -44,10 +44,14 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
         raise ValueError("mfma_f32_16x16x4f32_n2_ashared_kpipe supports f32 only")
     if block_k not in (16, 32):
         raise ValueError(f"unsupported block_k={block_k}, expected 16 or 32")
+    if epilogue not in ("direct", "remap"):
+        raise ValueError(f"unsupported epilogue={epilogue}, expected direct or remap")
 
     C_IN = c_in
     C_OUT = c_out
     KV = kv
+    EPILOGUE = epilogue
+    EPILOGUE_REMAP = EPILOGUE == "remap"
     BLOCK_M = 16
     BLOCK_K = block_k
     C_OUT_TILE = 16
@@ -64,11 +68,16 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
     W_STAGE_ELEMS = BLOCK_K * C_OUT_TILE
     W_STAGE_ELEMS_PER_BLOCK = W_STAGE_ELEMS * WAVES_PER_BLOCK
     W_STAGE_BYTES = W_STAGE_ELEMS_PER_BLOCK * 4
+    EPI_STAGE_ELEMS = BLOCK_M * C_OUT_TILE
+    EPI_STAGE_ELEMS_PER_BLOCK = EPI_STAGE_ELEMS * WAVES_PER_BLOCK
+    EPI_STAGE_BYTES = EPI_STAGE_ELEMS_PER_BLOCK * 4
 
     allocator = SmemAllocator(
         None,
         arch="gfx942",
-        global_sym_name=f"smem_ig_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{BLOCK_K}",
+        global_sym_name=(
+            f"smem_ig_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{BLOCK_K}_{EPILOGUE}"
+        ),
     )
     smem_row_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_row_offset + ROW_MAP_BYTES
@@ -76,6 +85,9 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
     allocator.ptr = smem_a_offset + A_STAGE_BYTES
     smem_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_w_offset + W_STAGE_BYTES
+    if EPILOGUE_REMAP:
+        smem_epi_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = smem_epi_offset + EPI_STAGE_BYTES
 
     A_LOAD_PER_BLOCK = math.ceil(A_STAGE_ELEMS / BLOCK_THREADS)
     W_LOAD_PER_WAVE = math.ceil(W_STAGE_ELEMS / 64)
@@ -105,6 +117,14 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
         a_lds = STensor(smem_a_ptr, T.f32, shape=(A_STAGE_ELEMS,))
         smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, T.f32, shape=(W_STAGE_ELEMS_PER_BLOCK,))
         w_lds = STensor(smem_w_ptr, T.f32, shape=(W_STAGE_ELEMS_PER_BLOCK,))
+        if const_expr(EPILOGUE_REMAP):
+            smem_epi_ptr = SmemPtr(
+                base_ptr,
+                smem_epi_offset,
+                T.f32,
+                shape=(EPI_STAGE_ELEMS_PER_BLOCK,),
+            )
+            epi_lds = STensor(smem_epi_ptr, T.f32, shape=(EPI_STAGE_ELEMS_PER_BLOCK,))
 
         wave_id = tid // fx.Int32(const_expr(64))
         lane = tid % fx.Int32(const_expr(64))
@@ -267,23 +287,61 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                         )
                         fx.memref_store_vec(new_acc, acc_reg)
 
-                    gpu.barrier()
+                    if const_expr(c_block + BLOCK_K < C_IN):
+                        gpu.barrier()
                 scf.YieldOp([])
 
         final_acc = fx.memref_load_vec(acc_reg)
-        for ri in range_constexpr(4):
-            store_row = row_tile_base + c_row_vec_base + fx.Int32(const_expr(ri))
+        if const_expr(EPILOGUE_REMAP):
+            wave_epi_offset = fx.Index(wave_id) * fx.Index(const_expr(EPI_STAGE_ELEMS))
+            for ri in range_constexpr(4):
+                epi_row = c_row_vec_base + fx.Int32(const_expr(ri))
+                epi_off = (
+                    wave_epi_offset
+                    + fx.Index(epi_row) * fx.Index(const_expr(C_OUT_TILE))
+                    + fx.Index(mfma_col)
+                )
+                val = vector.extract(
+                    final_acc,
+                    static_position=[const_expr(ri)],
+                    dynamic_position=[],
+                )
+                epi_lds.store(epi_off, val)
+            gpu.barrier()
+
+            epi_store_row = lane // fx.Int32(const_expr(4))
+            epi_col_vec = lane % fx.Int32(const_expr(4))
+            store_row = row_tile_base + epi_store_row
             store_ok = arith.cmpi(arith.CmpIPredicate.slt, store_row, num_act_out_val)
             store_if = scf.IfOp(store_ok, results_=[], has_else=False)
             with ir.InsertionPoint(store_if.then_block):
-                val = vector.extract(final_acc, static_position=[const_expr(ri)], dynamic_position=[])
+                epi_vec_off = (
+                    wave_epi_offset
+                    + fx.Index(epi_store_row) * fx.Index(const_expr(C_OUT_TILE))
+                    + fx.Index(epi_col_vec) * fx.Index(const_expr(4))
+                )
+                epi_vec = epi_lds.vec_load((epi_vec_off,), const_expr(4))
                 out_off = (
                     fx.Index(store_row) * fx.Index(const_expr(C_OUT))
                     + c_out_offset
-                    + fx.Index(mfma_col)
+                    + fx.Index(epi_col_vec) * fx.Index(const_expr(4))
                 )
-                out_.store(out_off, val)
+                out_.vec_store((out_off,), epi_vec, const_expr(4))
                 scf.YieldOp([])
+        else:
+            for ri in range_constexpr(4):
+                store_row = row_tile_base + c_row_vec_base + fx.Int32(const_expr(ri))
+                store_ok = arith.cmpi(arith.CmpIPredicate.slt, store_row, num_act_out_val)
+                store_if = scf.IfOp(store_ok, results_=[], has_else=False)
+                with ir.InsertionPoint(store_if.then_block):
+                    val = vector.extract(final_acc, static_position=[const_expr(ri)], dynamic_position=[])
+                    out_off = (
+                        fx.Index(store_row) * fx.Index(const_expr(C_OUT))
+                        + c_out_offset
+                        + fx.Index(mfma_col)
+                    )
+                    out_.store(out_off, val)
+                    scf.YieldOp([])
 
     @flyc.jit
     def launch_fn(
@@ -324,6 +382,7 @@ def _implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
     indice_pair_num: torch.Tensor,
     num_activate_out: int,
     block_k: int,
+    epilogue: str = "direct",
 ) -> Optional[torch.Tensor]:
     """Run the f32 16x16x4 MFMA N2 A-shared K-pipe kernel."""
     try:
@@ -355,12 +414,15 @@ def _implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
     if sorted_inp.shape[0] == 0:
         return torch.zeros(num_activate_out, c_out, dtype=torch.float32, device=device)
 
-    name = f"mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{block_k}"
-    key = (name, c_in, c_out, kv, dtype_str, block_k)
+    if epilogue == "direct":
+        name = f"mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{block_k}"
+    else:
+        name = f"mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{block_k}_{epilogue}"
+    key = (name, c_in, c_out, kv, dtype_str, block_k, epilogue)
     if key not in MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS:
         try:
             launch_fn, block_m = _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
-                c_in, c_out, kv, dtype_str, block_k
+                c_in, c_out, kv, dtype_str, block_k, epilogue
             )
             MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS[key] = (
                 launch_fn,
@@ -406,6 +468,19 @@ def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward(
     """Run the f32 16x16x4 MFMA N2 A-shared K-pipe BK16 kernel."""
     return _implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
         features, filters, indice_pairs, indice_pair_num, num_activate_out, 16
+    )
+
+
+def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward(
+    features: torch.Tensor,
+    filters: torch.Tensor,
+    indice_pairs: torch.Tensor,
+    indice_pair_num: torch.Tensor,
+    num_activate_out: int,
+) -> Optional[torch.Tensor]:
+    """Run the BK16 K-pipe kernel with LDS epilogue remap."""
+    return _implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
+        features, filters, indice_pairs, indice_pair_num, num_activate_out, 16, "remap"
     )
 
 

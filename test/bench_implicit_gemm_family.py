@@ -83,6 +83,7 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
         implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
         implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_forward,
         implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward,
+        implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward,
         implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward,
         implicit_gemm_mfma_f32_32x32x2f32_forward,
         implicit_gemm_scalar_tile_forward,
@@ -297,11 +298,19 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
     else:
         print("  [WARN] mfma_f32_16x16x4f32_n2_ashared failed, skipping")
 
-    for block_k, kpipe_forward in (
-        (16, implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward),
-        (32, implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward),
+    for block_k, epilogue, kpipe_forward in (
+        (16, "direct", implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward),
+        (
+            16,
+            "remap",
+            implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward,
+        ),
+        (32, "direct", implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward),
     ):
-        kpipe_name = f"mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{block_k}"
+        if epilogue == "direct":
+            kpipe_name = f"mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{block_k}"
+        else:
+            kpipe_name = f"mfma_f32_16x16x4f32_n2_ashared_kpipe_bk{block_k}_{epilogue}"
         impl_kpipe = kpipe_forward(features, filters, ip, ipn, n_active)
         if impl_kpipe is not None:
             print(
@@ -310,9 +319,9 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
             )
             bench_fn(
                 lambda fn=kpipe_forward: fn(features, filters, ip, ipn, n_active),
-                label=f"[K3-bk{block_k}] {kpipe_name} full",
+                label=f"[K3-bk{block_k}-{epilogue}] {kpipe_name} full",
             )
-            kpipe_key = (kpipe_name, c_in, c_out, kv, dtype_str, block_k)
+            kpipe_key = (kpipe_name, c_in, c_out, kv, dtype_str, block_k, epilogue)
             if (
                 kpipe_key in MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS
                 and hip is not None
@@ -345,7 +354,7 @@ def bench_config(n_active, c_in, c_out, kv, density, dtype, device):
 
                 bench_fn(
                     mfma_n2_ashared_kpipe_kernel_only,
-                    label=f"[K3-bk{block_k}.3] {kpipe_name} kernel only",
+                    label=f"[K3-bk{block_k}-{epilogue}.3] {kpipe_name} kernel only",
                 )
         else:
             print(f"  [WARN] {kpipe_name} failed, skipping")

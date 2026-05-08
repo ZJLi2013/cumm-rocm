@@ -100,6 +100,23 @@ class TestImplicitGemmDispatchDescriptors:
         assert bk16.ashared is True
         assert bk16.epilogue == "direct"
 
+    def test_bk16_remap_descriptor_metadata(self):
+        from cumm.implicit_gemm import get_implicit_gemm_candidates
+
+        candidates = get_implicit_gemm_candidates(torch.float32, 32, 32)
+        remap = next(
+            desp
+            for desp in candidates
+            if desp.name == "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap"
+        )
+
+        assert remap.tile_m == 16
+        assert remap.tile_n == 32
+        assert remap.block_k == 16
+        assert remap.waves == 2
+        assert remap.ashared is True
+        assert remap.epilogue == "remap"
+
     def test_dispatch_prefers_bk16_for_mid_channels(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
 
@@ -707,6 +724,7 @@ class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipe:
         "fn_name",
         [
             "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward",
             "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
         ],
     )
@@ -717,6 +735,7 @@ class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipe:
         "fn_name",
         [
             "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward",
             "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
         ],
     )
@@ -727,6 +746,7 @@ class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipe:
         "fn_name",
         [
             "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward",
             "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
         ],
     )
@@ -737,6 +757,7 @@ class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipe:
         "fn_name",
         [
             "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
+            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward",
             "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
         ],
     )
