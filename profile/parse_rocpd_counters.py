@@ -8,41 +8,58 @@ import sys
 from collections import defaultdict
 
 
-def extract_counters(db_path):
+def _find_table(tables, prefix):
+    for t in tables:
+        if t.startswith(prefix):
+            return t
+    return None
+
+
+def extract_counters(db_path, target_kernel=None):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
     cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = [r[0] for r in cur.fetchall()]
 
+    pmc_info_t = _find_table(tables, "rocpd_info_pmc_")
+    pmc_event_t = _find_table(tables, "rocpd_pmc_event_")
+    kd_t = _find_table(tables, "rocpd_kernel_dispatch_")
+    ks_t = _find_table(tables, "rocpd_info_kernel_symbol_")
+
+    if not (pmc_info_t and pmc_event_t and kd_t):
+        print(f"WARNING: missing tables in {db_path}")
+        return {}
+
+    pmc_names = {}
+    cur.execute(f"SELECT id, name FROM {pmc_info_t}")
+    for row in cur.fetchall():
+        pmc_names[row[0]] = row[1]
+
+    target_event_ids = set()
+    if target_kernel and ks_t:
+        cur.execute(f"SELECT id, kernel_name FROM {ks_t}")
+        target_kid = None
+        for row in cur.fetchall():
+            if target_kernel in str(row[1]):
+                target_kid = row[0]
+                break
+        if target_kid is not None:
+            cur.execute(f"SELECT event_id FROM {kd_t} WHERE kernel_id = ?", (target_kid,))
+            target_event_ids = {r[0] for r in cur.fetchall()}
+    else:
+        cur.execute(f"SELECT event_id FROM {kd_t}")
+        target_event_ids = {r[0] for r in cur.fetchall()}
+
     counters = defaultdict(float)
     count = defaultdict(int)
-
-    if "rocpd_info_pmc" in tables:
-        cur.execute("SELECT * FROM rocpd_info_pmc")
-        cols = [d[0] for d in cur.description]
-        for row in cur.fetchall():
-            rd = dict(zip(cols, row))
-            name = rd.get("counter_name") or rd.get("Counter_Name") or rd.get("name", "")
-            val = rd.get("counter_value") or rd.get("Counter_Value") or rd.get("value", 0)
-            if name:
-                try:
-                    counters[name] += float(val)
-                    count[name] += 1
-                except (ValueError, TypeError):
-                    pass
-
-    if not counters and "rocpd_kernel_dispatch" in tables:
-        cur.execute("SELECT * FROM rocpd_kernel_dispatch LIMIT 1")
-        cols = [d[0] for d in cur.description]
-        pmc_cols = [c for c in cols if c.startswith("SQ_") or c.startswith("TCP_") or c.startswith("TCC_")]
-        if pmc_cols:
-            cur.execute(f"SELECT {','.join(pmc_cols)} FROM rocpd_kernel_dispatch")
-            for row in cur.fetchall():
-                for i, col in enumerate(pmc_cols):
-                    if row[i] is not None:
-                        counters[col] += float(row[i])
-                        count[col] += 1
+    cur.execute(f"SELECT event_id, pmc_id, value FROM {pmc_event_t}")
+    for eid, pid, val in cur.fetchall():
+        if eid in target_event_ids and pid in pmc_names:
+            name = pmc_names[pid]
+            if val is not None:
+                counters[name] += float(val)
+                count[name] += 1
 
     conn.close()
 
@@ -53,17 +70,20 @@ def extract_counters(db_path):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python parse_rocpd_counters.py <db_a> [db_b]")
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("db_a", help="Path to first rocpd results.db")
+    parser.add_argument("db_b", nargs="?", help="Path to second rocpd results.db (for A/B comparison)")
+    parser.add_argument("--kernel", default=None, help="Filter to kernel name substring")
+    args = parser.parse_args()
 
-    db_a = sys.argv[1]
-    db_b = sys.argv[2] if len(sys.argv) > 2 else None
+    db_a = args.db_a
+    db_b = args.db_b
 
-    a = extract_counters(db_a)
+    a = extract_counters(db_a, target_kernel=args.kernel)
 
     if db_b:
-        b = extract_counters(db_b)
+        b = extract_counters(db_b, target_kernel=args.kernel)
         all_keys = sorted(set(list(a.keys()) + list(b.keys())))
         label_a = db_a.split("/")[-1].replace("_results.db", "")
         label_b = db_b.split("/")[-1].replace("_results.db", "")
