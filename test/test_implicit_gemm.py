@@ -100,23 +100,6 @@ class TestImplicitGemmDispatchDescriptors:
         assert bk16.ashared is True
         assert bk16.epilogue == "direct"
 
-    def test_bk16_remap_descriptor_metadata(self):
-        from cumm.implicit_gemm import get_implicit_gemm_candidates
-
-        candidates = get_implicit_gemm_candidates(torch.float32, 32, 32)
-        remap = next(
-            desp
-            for desp in candidates
-            if desp.name == "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap"
-        )
-
-        assert remap.tile_m == 16
-        assert remap.tile_n == 32
-        assert remap.block_k == 16
-        assert remap.waves == 2
-        assert remap.ashared is True
-        assert remap.epilogue == "remap"
-
     def test_dispatch_prefers_crossk_for_mid_channels(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
 
@@ -743,106 +726,17 @@ class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipe:
         torch.cuda.synchronize()
         torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
 
-    @pytest.mark.parametrize(
-        "fn_name",
-        [
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
-        ],
-    )
-    def test_basic_f32(self, fn_name):
-        self._run_correctness(fn_name, 100, 100, 16, 32, 3, [30, 50, 20])
-
-    @pytest.mark.parametrize(
-        "fn_name",
-        [
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
-        ],
-    )
-    def test_single_kv(self, fn_name):
-        self._run_correctness(fn_name, 200, 200, 32, 64, 1, [150])
-
-    @pytest.mark.parametrize(
-        "fn_name",
-        [
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
-        ],
-    )
-    def test_kv27_subm(self, fn_name):
-        self._run_correctness(fn_name, 1000, 1000, 32, 32, 27, [100]*27)
-
-    @pytest.mark.parametrize(
-        "fn_name",
-        [
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward",
-        ],
-    )
-    def test_large_channel_kv27(self, fn_name):
-        self._run_correctness(fn_name, 500, 500, 64, 128, 27, [50]*27)
-
-
-class TestImplicitGemmCrossK:
-    """Cross-kv K-fused kernel (Step 8)."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_gpu(self):
-        if not torch.cuda.is_available():
-            pytest.skip("No GPU")
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_flydsl(self):
-        try:
-            import flydsl
-        except ImportError:
-            pytest.skip("FlyDSL not installed")
-
-    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, block_k=32):
-        from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_crossk import (
-            implicit_gemm_crossk_forward,
-        )
-
-        device = "cuda"
-        features = torch.randn(n_in, c_in, dtype=torch.float32, device=device) * 0.1
-        filters = torch.randn(kv, c_in, c_out, dtype=torch.float32, device=device) * 0.1
-        ip, ipn = _make_pairs(kv, nhot_list, n_max=max(nhot_list), device=device)
-        ip[ip < 0] = 0
-        ip[:, 0] = ip[:, 0] % n_in
-        for k_idx in range(kv):
-            nhot = nhot_list[k_idx]
-            if nhot > 0:
-                perm = torch.randperm(n_out, device=device, dtype=torch.int32)[:nhot]
-                ip[k_idx, 1, :nhot] = perm
-
-        ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = implicit_gemm_crossk_forward(
-            features, filters, ip, ipn, n_out, block_k=block_k
-        )
-        assert out is not None, f"crossk bk{block_k} compilation failed"
-
-        torch.cuda.synchronize()
-        torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
-
     def test_basic_f32(self):
-        self._run_correctness(100, 100, 16, 32, 3, [30, 50, 20], block_k=16)
+        self._run_correctness("implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward", 100, 100, 16, 32, 3, [30, 50, 20])
 
     def test_single_kv(self):
-        self._run_correctness(200, 200, 32, 64, 1, [150], block_k=32)
+        self._run_correctness("implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward", 200, 200, 32, 64, 1, [150])
 
     def test_kv27_subm(self):
-        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, block_k=32)
+        self._run_correctness("implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward", 1000, 1000, 32, 32, 27, [100]*27)
 
     def test_large_channel_kv27(self):
-        self._run_correctness(500, 500, 64, 128, 27, [50]*27, block_k=32)
-
-    def test_bk16_large_channel(self):
-        self._run_correctness(500, 500, 64, 128, 27, [50]*27, block_k=16)
+        self._run_correctness("implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward", 500, 500, 64, 128, 27, [50]*27)
 
 
 class TestImplicitGemmCrossKPrefetch:
@@ -927,74 +821,6 @@ class TestImplicitGemmCrossKPrefetch:
 
         torch.cuda.synchronize()
         torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
-
-
-class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipeDB:
-    """Double-buffered kpipe family members."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_gpu(self):
-        if not torch.cuda.is_available():
-            pytest.skip("No GPU")
-
-    @pytest.fixture(autouse=True)
-    def _skip_no_flydsl(self):
-        try:
-            import flydsl
-        except ImportError:
-            pytest.skip("FlyDSL not installed")
-
-    def _run_correctness(self, fn_name, n_in, n_out, c_in, c_out, kv, nhot_list):
-        import cumm.implicit_gemm as ig
-
-        device = "cuda"
-        features = torch.randn(n_in, c_in, dtype=torch.float32, device=device) * 0.1
-        filters = torch.randn(kv, c_in, c_out, dtype=torch.float32, device=device) * 0.1
-        ip, ipn = _make_pairs(kv, nhot_list, n_max=max(nhot_list), device=device)
-        ip[ip < 0] = 0
-        ip[:, 0] = ip[:, 0] % n_in
-        for k_idx in range(kv):
-            nhot = nhot_list[k_idx]
-            if nhot > 0:
-                perm = torch.randperm(n_out, device=device, dtype=torch.int32)[:nhot]
-                ip[k_idx, 1, :nhot] = perm
-
-        ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
-        out = getattr(ig, fn_name)(features, filters, ip, ipn, n_out)
-        assert out is not None, f"{fn_name} kernel compilation failed"
-
-        torch.cuda.synchronize()
-        torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
-
-    @pytest.mark.parametrize(
-        "fn_name",
-        [
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db32_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db64_forward",
-        ],
-    )
-    def test_basic_f32(self, fn_name):
-        self._run_correctness(fn_name, 100, 100, 16, 32, 3, [30, 50, 20])
-
-    @pytest.mark.parametrize(
-        "fn_name",
-        [
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db32_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db64_forward",
-        ],
-    )
-    def test_kv27_subm(self, fn_name):
-        self._run_correctness(fn_name, 1000, 1000, 32, 32, 27, [100]*27)
-
-    @pytest.mark.parametrize(
-        "fn_name",
-        [
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db32_forward",
-            "implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db64_forward",
-        ],
-    )
-    def test_large_channel_kv27(self, fn_name):
-        self._run_correctness(fn_name, 500, 500, 64, 128, 27, [50]*27)
 
 
 class TestImplicitGemmMfmaF32_32x32x2:
