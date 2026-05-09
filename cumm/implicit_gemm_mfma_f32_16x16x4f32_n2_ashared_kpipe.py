@@ -70,6 +70,9 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
     W_STAGE_ELEMS = BLOCK_K * C_OUT_TILE
     W_STAGE_ELEMS_PER_BLOCK = W_STAGE_ELEMS * WAVES_PER_BLOCK
     W_STAGE_BYTES = W_STAGE_ELEMS_PER_BLOCK * 4
+    LDS_STAGES = 2
+    A_TOTAL_PADDED = A_STAGE_ELEMS_PADDED * LDS_STAGES
+    W_TOTAL_PER_BLOCK = W_STAGE_ELEMS_PER_BLOCK * LDS_STAGES
     EPI_STAGE_ELEMS = BLOCK_M * C_OUT_TILE
     EPI_STAGE_ELEMS_PER_BLOCK = EPI_STAGE_ELEMS * WAVES_PER_BLOCK
     EPI_STAGE_BYTES = EPI_STAGE_ELEMS_PER_BLOCK * 4
@@ -84,9 +87,9 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
     smem_row_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_row_offset + ROW_MAP_BYTES
     smem_a_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_a_offset + A_STAGE_BYTES
+    allocator.ptr = smem_a_offset + A_TOTAL_PADDED * 4
     smem_w_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_w_offset + W_STAGE_BYTES
+    allocator.ptr = smem_w_offset + W_TOTAL_PER_BLOCK * 4
     if EPILOGUE_REMAP:
         smem_epi_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_epi_offset + EPI_STAGE_BYTES
@@ -121,10 +124,10 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
         base_ptr = allocator.get_base()
         smem_row_ptr = SmemPtr(base_ptr, smem_row_offset, T.i32, shape=(ROW_MAP_ELEMS,))
         row_lds = STensor(smem_row_ptr, T.i32, shape=(ROW_MAP_ELEMS,))
-        smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, T.f32, shape=(A_STAGE_ELEMS_PADDED,))
-        a_lds = STensor(smem_a_ptr, T.f32, shape=(A_STAGE_ELEMS_PADDED,))
-        smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, T.f32, shape=(W_STAGE_ELEMS_PER_BLOCK,))
-        w_lds = STensor(smem_w_ptr, T.f32, shape=(W_STAGE_ELEMS_PER_BLOCK,))
+        smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, T.f32, shape=(A_TOTAL_PADDED,))
+        a_lds = STensor(smem_a_ptr, T.f32, shape=(A_TOTAL_PADDED,))
+        smem_w_ptr = SmemPtr(base_ptr, smem_w_offset, T.f32, shape=(W_TOTAL_PER_BLOCK,))
+        w_lds = STensor(smem_w_ptr, T.f32, shape=(W_TOTAL_PER_BLOCK,))
         if const_expr(EPILOGUE_REMAP):
             smem_epi_ptr = SmemPtr(
                 base_ptr,
@@ -159,6 +162,8 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
         acc_reg_lay = fx.make_layout(const_expr(4), 1)
         acc_reg = fx.memref_alloca(acc_reg_ty, acc_reg_lay)
         fx.memref_store_vec(zero_acc, acc_reg)
+        prefetch_a_reg = fx.memref_alloca(acc_reg_ty, acc_reg_lay)
+        prefetch_w_reg = fx.memref_alloca(acc_reg_ty, acc_reg_lay)
 
         wave_w_offset = fx.Index(wave_id) * fx.Index(const_expr(W_STAGE_ELEMS))
 
@@ -203,54 +208,245 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                     scf.YieldOp([])
                 gpu.barrier()
 
-                for c_block in range_constexpr(0, C_IN, BLOCK_K):
-                    if const_expr(BLOCK_K == 16 and c_block + BLOCK_K <= C_IN):
-                        # Stage A with vec4 global loads. Sparse rows are irregular,
-                        # but channels within each row are contiguous.
-                        for ai in range_constexpr(A_VEC_LOAD_PER_BLOCK):
-                            a_vec_idx = fx.Index(const_expr(ai * BLOCK_THREADS)) + fx.Index(tid)
-                            a_vec_valid = arith.cmpi(
-                                arith.CmpIPredicate.ult,
-                                a_vec_idx,
-                                fx.Index(const_expr(A_VEC_GROUPS)),
+                if const_expr(BLOCK_K == 16):
+                    # ===== PREFETCH PIPELINE (BK16 vec4 path) =====
+                    # Overlap VMEM loads with MFMA by issuing buffer_load for
+                    # next c_block before computing MFMA on the current one.
+                    # LLVM defers s_waitcnt until the prefetch VGPRs are consumed
+                    # by ds_write, hiding sparse gather latency behind MFMA.
+                    w_base = fx.Index(
+                        const_expr(k * N_C_OUT_TILES * C_IN * C_OUT_TILE)
+                    ) + fx.Index(ct) * fx.Index(const_expr(C_IN * C_OUT_TILE))
+
+                    # -- PROLOGUE: load c_block=0 into LDS stage 0 --
+                    for ai in range_constexpr(A_VEC_LOAD_PER_BLOCK):
+                        a_vec_idx = fx.Index(const_expr(ai * BLOCK_THREADS)) + fx.Index(tid)
+                        a_vec_valid = arith.cmpi(
+                            arith.CmpIPredicate.ult,
+                            a_vec_idx,
+                            fx.Index(const_expr(A_VEC_GROUPS)),
+                        )
+                        a_vec_if = scf.IfOp(a_vec_valid, results_=[], has_else=False)
+                        with ir.InsertionPoint(a_vec_if.then_block):
+                            a_row_idx = a_vec_idx // fx.Index(const_expr(BLOCK_K // A_VEC))
+                            a_k_vec_idx = a_vec_idx % fx.Index(const_expr(BLOCK_K // A_VEC))
+                            safe_row_base = row_lds.load(a_row_idx)
+                            row_valid_i32 = row_lds.load(
+                                fx.Index(const_expr(BLOCK_M)) + a_row_idx
                             )
-                            a_vec_if = scf.IfOp(a_vec_valid, results_=[], has_else=False)
-                            with ir.InsertionPoint(a_vec_if.then_block):
-                                a_row_idx = a_vec_idx // fx.Index(const_expr(BLOCK_K // A_VEC))
-                                a_k_vec_idx = a_vec_idx % fx.Index(const_expr(BLOCK_K // A_VEC))
-                                safe_row_base = row_lds.load(a_row_idx)
-                                row_valid_i32 = row_lds.load(
-                                    fx.Index(const_expr(BLOCK_M)) + a_row_idx
+                            row_valid = arith.cmpi(
+                                arith.CmpIPredicate.ne,
+                                row_valid_i32,
+                                zero_i32,
+                            )
+                            feat_off = (
+                                fx.Index(safe_row_base)
+                                + a_k_vec_idx * fx.Index(const_expr(A_VEC))
+                            )
+                            a_vec = feat_.vec_load((feat_off,), const_expr(A_VEC))
+                            a_lds_base = (
+                                a_row_idx * fx.Index(const_expr(A_LDS_STRIDE))
+                                + a_k_vec_idx * fx.Index(const_expr(A_VEC))
+                            )
+                            for vi in range_constexpr(A_VEC):
+                                a_val = vector.extract(
+                                    a_vec,
+                                    static_position=[const_expr(vi)],
+                                    dynamic_position=[],
                                 )
-                                row_valid = arith.cmpi(
-                                    arith.CmpIPredicate.ne,
-                                    row_valid_i32,
-                                    zero_i32,
+                                a_val = arith.select(row_valid, a_val, zero_f32)
+                                a_lds.store(
+                                    a_lds_base + fx.Index(const_expr(vi)),
+                                    a_val,
                                 )
-                                feat_off = (
-                                    fx.Index(safe_row_base)
-                                    + fx.Index(const_expr(c_block))
-                                    + a_k_vec_idx * fx.Index(const_expr(A_VEC))
+                            scf.YieldOp([])
+                    for wi in range_constexpr(W_VEC_LOAD_PER_WAVE):
+                        w_vec_idx = fx.Index(const_expr(wi * 64)) + fx.Index(lane)
+                        w_vec_valid = arith.cmpi(
+                            arith.CmpIPredicate.ult,
+                            w_vec_idx,
+                            fx.Index(const_expr(W_VEC_GROUPS)),
+                        )
+                        w_vec_if = scf.IfOp(w_vec_valid, results_=[], has_else=False)
+                        with ir.InsertionPoint(w_vec_if.then_block):
+                            w_k_idx = w_vec_idx // fx.Index(const_expr(C_OUT_TILE // W_VEC))
+                            w_col_vec = w_vec_idx % fx.Index(const_expr(C_OUT_TILE // W_VEC))
+                            w_src = (
+                                w_base
+                                + w_k_idx * fx.Index(const_expr(C_OUT_TILE))
+                                + w_col_vec * fx.Index(const_expr(W_VEC))
+                            )
+                            w_vec = wp_.vec_load((w_src,), const_expr(W_VEC))
+                            w_lds_base = (
+                                wave_w_offset
+                                + w_k_idx * fx.Index(const_expr(C_OUT_TILE))
+                                + w_col_vec * fx.Index(const_expr(W_VEC))
+                            )
+                            for vi in range_constexpr(W_VEC):
+                                w_val = vector.extract(
+                                    w_vec,
+                                    static_position=[const_expr(vi)],
+                                    dynamic_position=[],
                                 )
-                                a_vec = feat_.vec_load((feat_off,), const_expr(A_VEC))
-                                a_lds_base = (
-                                    a_row_idx * fx.Index(const_expr(A_LDS_STRIDE))
-                                    + a_k_vec_idx * fx.Index(const_expr(A_VEC))
+                                w_lds.store(w_lds_base + fx.Index(const_expr(vi)), w_val)
+                            scf.YieldOp([])
+                    gpu.barrier()
+
+                    # -- MAIN LOOP with prefetch --
+                    for c_block in range_constexpr(0, C_IN, BLOCK_K):
+                        c_idx = c_block // BLOCK_K
+                        READ_A_OFF = (c_idx % LDS_STAGES) * A_STAGE_ELEMS_PADDED
+                        READ_W_OFF = (c_idx % LDS_STAGES) * W_STAGE_ELEMS_PER_BLOCK
+                        WRITE_A_OFF = ((c_idx + 1) % LDS_STAGES) * A_STAGE_ELEMS_PADDED
+                        WRITE_W_OFF = ((c_idx + 1) % LDS_STAGES) * W_STAGE_ELEMS_PER_BLOCK
+                        next_c = c_block + BLOCK_K
+
+                        # 1) Issue VMEM prefetch for next c_block into registers
+                        if const_expr(next_c < C_IN):
+                            fx.memref_store_vec(zero_acc, prefetch_a_reg)
+                            for ai in range_constexpr(A_VEC_LOAD_PER_BLOCK):
+                                a_vec_idx = fx.Index(const_expr(ai * BLOCK_THREADS)) + fx.Index(tid)
+                                a_vec_valid = arith.cmpi(
+                                    arith.CmpIPredicate.ult,
+                                    a_vec_idx,
+                                    fx.Index(const_expr(A_VEC_GROUPS)),
                                 )
-                                for vi in range_constexpr(A_VEC):
-                                    a_val = vector.extract(
-                                        a_vec,
-                                        static_position=[const_expr(vi)],
-                                        dynamic_position=[],
+                                pf_a_if = scf.IfOp(a_vec_valid, results_=[], has_else=False)
+                                with ir.InsertionPoint(pf_a_if.then_block):
+                                    a_row_idx = a_vec_idx // fx.Index(const_expr(BLOCK_K // A_VEC))
+                                    a_k_vec_idx = a_vec_idx % fx.Index(const_expr(BLOCK_K // A_VEC))
+                                    safe_row_base = row_lds.load(a_row_idx)
+                                    feat_off = (
+                                        fx.Index(safe_row_base)
+                                        + fx.Index(const_expr(next_c))
+                                        + a_k_vec_idx * fx.Index(const_expr(A_VEC))
                                     )
-                                    a_val = arith.select(row_valid, a_val, zero_f32)
-                                    a_lds.store(
-                                        a_lds_base + fx.Index(const_expr(vi)),
-                                        a_val,
+                                    a_vec = feat_.vec_load((feat_off,), const_expr(A_VEC))
+                                    fx.memref_store_vec(a_vec, prefetch_a_reg)
+                                    scf.YieldOp([])
+
+                            fx.memref_store_vec(zero_acc, prefetch_w_reg)
+                            for wi in range_constexpr(W_VEC_LOAD_PER_WAVE):
+                                w_vec_idx = fx.Index(const_expr(wi * 64)) + fx.Index(lane)
+                                w_vec_valid = arith.cmpi(
+                                    arith.CmpIPredicate.ult,
+                                    w_vec_idx,
+                                    fx.Index(const_expr(W_VEC_GROUPS)),
+                                )
+                                pf_w_if = scf.IfOp(w_vec_valid, results_=[], has_else=False)
+                                with ir.InsertionPoint(pf_w_if.then_block):
+                                    w_k_idx = w_vec_idx // fx.Index(const_expr(C_OUT_TILE // W_VEC))
+                                    w_col_vec = w_vec_idx % fx.Index(const_expr(C_OUT_TILE // W_VEC))
+                                    w_src = (
+                                        w_base
+                                        + (fx.Index(const_expr(next_c)) + w_k_idx)
+                                        * fx.Index(const_expr(C_OUT_TILE))
+                                        + w_col_vec * fx.Index(const_expr(W_VEC))
                                     )
-                                scf.YieldOp([])
-                    else:
-                        # Stage A[16 x BLOCK_K], reusing the prepared safe row map.
+                                    w_vec = wp_.vec_load((w_src,), const_expr(W_VEC))
+                                    fx.memref_store_vec(w_vec, prefetch_w_reg)
+                                    scf.YieldOp([])
+
+                        # 2) MFMA from current read stage
+                        for kk in range_constexpr(0, BLOCK_K, 4):
+                            a_off = (
+                                fx.Index(const_expr(READ_A_OFF))
+                                + fx.Index(mfma_row) * fx.Index(const_expr(A_LDS_STRIDE))
+                                + fx.Index(const_expr(kk))
+                                + fx.Index(mfma_k_lane)
+                            )
+                            a_val = a_lds.load(a_off)
+                            b_off = (
+                                fx.Index(const_expr(READ_W_OFF))
+                                + wave_w_offset
+                                + fx.Index(const_expr(kk * C_OUT_TILE))
+                                + fx.Index(mfma_k_lane) * fx.Index(const_expr(C_OUT_TILE))
+                                + fx.Index(mfma_col)
+                            )
+                            b_val = w_lds.load(b_off)
+                            cur_acc = fx.memref_load_vec(acc_reg)
+                            new_acc = rocdl.mfma_f32_16x16x4f32(
+                                T.vec(4, T.f32), a_val, b_val, cur_acc, 0, 0, 0
+                            )
+                            fx.memref_store_vec(new_acc, acc_reg)
+
+                        # 3) Barrier: protect current read stage
+                        gpu.barrier()
+
+                        # 4) Store prefetched data to alternate LDS stage
+                        if const_expr(next_c < C_IN):
+                            for ai in range_constexpr(A_VEC_LOAD_PER_BLOCK):
+                                a_vec_idx = fx.Index(const_expr(ai * BLOCK_THREADS)) + fx.Index(tid)
+                                a_vec_valid = arith.cmpi(
+                                    arith.CmpIPredicate.ult,
+                                    a_vec_idx,
+                                    fx.Index(const_expr(A_VEC_GROUPS)),
+                                )
+                                st_a_if = scf.IfOp(a_vec_valid, results_=[], has_else=False)
+                                with ir.InsertionPoint(st_a_if.then_block):
+                                    a_row_idx = a_vec_idx // fx.Index(const_expr(BLOCK_K // A_VEC))
+                                    a_k_vec_idx = a_vec_idx % fx.Index(const_expr(BLOCK_K // A_VEC))
+                                    pf_a_vec = fx.memref_load_vec(prefetch_a_reg)
+                                    row_valid_i32 = row_lds.load(
+                                        fx.Index(const_expr(BLOCK_M)) + a_row_idx
+                                    )
+                                    row_valid = arith.cmpi(
+                                        arith.CmpIPredicate.ne,
+                                        row_valid_i32,
+                                        zero_i32,
+                                    )
+                                    a_lds_base = (
+                                        fx.Index(const_expr(WRITE_A_OFF))
+                                        + a_row_idx * fx.Index(const_expr(A_LDS_STRIDE))
+                                        + a_k_vec_idx * fx.Index(const_expr(A_VEC))
+                                    )
+                                    for vi in range_constexpr(A_VEC):
+                                        a_val = vector.extract(
+                                            pf_a_vec,
+                                            static_position=[const_expr(vi)],
+                                            dynamic_position=[],
+                                        )
+                                        a_val = arith.select(row_valid, a_val, zero_f32)
+                                        a_lds.store(
+                                            a_lds_base + fx.Index(const_expr(vi)),
+                                            a_val,
+                                        )
+                                    scf.YieldOp([])
+
+                            for wi in range_constexpr(W_VEC_LOAD_PER_WAVE):
+                                w_vec_idx = fx.Index(const_expr(wi * 64)) + fx.Index(lane)
+                                w_vec_valid = arith.cmpi(
+                                    arith.CmpIPredicate.ult,
+                                    w_vec_idx,
+                                    fx.Index(const_expr(W_VEC_GROUPS)),
+                                )
+                                st_w_if = scf.IfOp(w_vec_valid, results_=[], has_else=False)
+                                with ir.InsertionPoint(st_w_if.then_block):
+                                    w_k_idx = w_vec_idx // fx.Index(const_expr(C_OUT_TILE // W_VEC))
+                                    w_col_vec = w_vec_idx % fx.Index(const_expr(C_OUT_TILE // W_VEC))
+                                    pf_w_vec = fx.memref_load_vec(prefetch_w_reg)
+                                    w_lds_base = (
+                                        fx.Index(const_expr(WRITE_W_OFF))
+                                        + wave_w_offset
+                                        + w_k_idx * fx.Index(const_expr(C_OUT_TILE))
+                                        + w_col_vec * fx.Index(const_expr(W_VEC))
+                                    )
+                                    for vi in range_constexpr(W_VEC):
+                                        w_val = vector.extract(
+                                            pf_w_vec,
+                                            static_position=[const_expr(vi)],
+                                            dynamic_position=[],
+                                        )
+                                        w_lds.store(
+                                            w_lds_base + fx.Index(const_expr(vi)),
+                                            w_val,
+                                        )
+                                    scf.YieldOp([])
+
+                            gpu.barrier()
+                else:
+                    # BK32 fallback: original serial load-then-compute path.
+                    for c_block in range_constexpr(0, C_IN, BLOCK_K):
                         for ai in range_constexpr(A_LOAD_PER_BLOCK):
                             a_elem_idx = fx.Index(const_expr(ai * BLOCK_THREADS)) + fx.Index(tid)
                             a_valid = arith.cmpi(
@@ -289,41 +485,9 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                                 )
                                 scf.YieldOp([])
 
-                    w_base = fx.Index(
-                        const_expr(k * N_C_OUT_TILES * C_IN * C_OUT_TILE)
-                    ) + fx.Index(ct) * fx.Index(const_expr(C_IN * C_OUT_TILE))
-                    if const_expr(BLOCK_K == 16 and c_block + BLOCK_K <= C_IN and C_OUT_TILE % W_VEC == 0):
-                        for wi in range_constexpr(W_VEC_LOAD_PER_WAVE):
-                            w_vec_idx = fx.Index(const_expr(wi * 64)) + fx.Index(lane)
-                            w_vec_valid = arith.cmpi(
-                                arith.CmpIPredicate.ult,
-                                w_vec_idx,
-                                fx.Index(const_expr(W_VEC_GROUPS)),
-                            )
-                            w_vec_if = scf.IfOp(w_vec_valid, results_=[], has_else=False)
-                            with ir.InsertionPoint(w_vec_if.then_block):
-                                w_k_idx = w_vec_idx // fx.Index(const_expr(C_OUT_TILE // W_VEC))
-                                w_col_vec = w_vec_idx % fx.Index(const_expr(C_OUT_TILE // W_VEC))
-                                w_src = (
-                                    w_base
-                                    + (fx.Index(const_expr(c_block)) + w_k_idx) * fx.Index(const_expr(C_OUT_TILE))
-                                    + w_col_vec * fx.Index(const_expr(W_VEC))
-                                )
-                                w_vec = wp_.vec_load((w_src,), const_expr(W_VEC))
-                                w_lds_base = (
-                                    wave_w_offset
-                                    + w_k_idx * fx.Index(const_expr(C_OUT_TILE))
-                                    + w_col_vec * fx.Index(const_expr(W_VEC))
-                                )
-                                for vi in range_constexpr(W_VEC):
-                                    w_val = vector.extract(
-                                        w_vec,
-                                        static_position=[const_expr(vi)],
-                                        dynamic_position=[],
-                                    )
-                                    w_lds.store(w_lds_base + fx.Index(const_expr(vi)), w_val)
-                                scf.YieldOp([])
-                    else:
+                        w_base = fx.Index(
+                            const_expr(k * N_C_OUT_TILES * C_IN * C_OUT_TILE)
+                        ) + fx.Index(ct) * fx.Index(const_expr(C_IN * C_OUT_TILE))
                         for wi in range_constexpr(W_LOAD_PER_WAVE):
                             w_elem_idx = fx.Index(const_expr(wi * 64)) + fx.Index(lane)
                             w_valid = arith.cmpi(
@@ -352,30 +516,30 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                                 b_val = arith.select(c_valid, b_val, zero_f32)
                                 w_lds.store(wave_w_offset + w_elem_idx, b_val)
                                 scf.YieldOp([])
-                    gpu.barrier()
-
-                    for kk in range_constexpr(0, BLOCK_K, 4):
-                        a_off = (
-                            fx.Index(mfma_row) * fx.Index(const_expr(A_LDS_STRIDE))
-                            + fx.Index(const_expr(kk))
-                            + fx.Index(mfma_k_lane)
-                        )
-                        a_val = a_lds.load(a_off)
-                        b_off = (
-                            wave_w_offset
-                            + fx.Index(const_expr(kk * C_OUT_TILE))
-                            + fx.Index(mfma_k_lane) * fx.Index(const_expr(C_OUT_TILE))
-                            + fx.Index(mfma_col)
-                        )
-                        b_val = w_lds.load(b_off)
-                        cur_acc = fx.memref_load_vec(acc_reg)
-                        new_acc = rocdl.mfma_f32_16x16x4f32(
-                            T.vec(4, T.f32), a_val, b_val, cur_acc, 0, 0, 0
-                        )
-                        fx.memref_store_vec(new_acc, acc_reg)
-
-                    if const_expr(c_block + BLOCK_K < C_IN):
                         gpu.barrier()
+
+                        for kk in range_constexpr(0, BLOCK_K, 4):
+                            a_off = (
+                                fx.Index(mfma_row) * fx.Index(const_expr(A_LDS_STRIDE))
+                                + fx.Index(const_expr(kk))
+                                + fx.Index(mfma_k_lane)
+                            )
+                            a_val = a_lds.load(a_off)
+                            b_off = (
+                                wave_w_offset
+                                + fx.Index(const_expr(kk * C_OUT_TILE))
+                                + fx.Index(mfma_k_lane) * fx.Index(const_expr(C_OUT_TILE))
+                                + fx.Index(mfma_col)
+                            )
+                            b_val = w_lds.load(b_off)
+                            cur_acc = fx.memref_load_vec(acc_reg)
+                            new_acc = rocdl.mfma_f32_16x16x4f32(
+                                T.vec(4, T.f32), a_val, b_val, cur_acc, 0, 0, 0
+                            )
+                            fx.memref_store_vec(new_acc, acc_reg)
+
+                        if const_expr(c_block + BLOCK_K < C_IN):
+                            gpu.barrier()
                 scf.YieldOp([])
 
         final_acc = fx.memref_load_vec(acc_reg)
