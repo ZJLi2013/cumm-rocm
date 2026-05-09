@@ -1,4 +1,7 @@
-"""Head-to-head comparison: crossk (Step 8) vs kpipe baseline (Step 5)."""
+"""Head-to-head comparison: crossk (Step 8) vs kpipe baseline (Step 5).
+
+Measures kernel launch time only (preprocessing is excluded).
+"""
 import argparse
 import os
 import sys
@@ -61,10 +64,14 @@ def main():
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
+    from cumm.implicit_gemm_common import _get_hip_module, _pack_weights
     from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe import (
+        MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS,
         implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward,
     )
     from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_crossk import (
+        CROSSK_COMPILED_KERNELS,
+        _build_active_kv_ids,
         implicit_gemm_crossk_forward,
     )
 
@@ -74,74 +81,70 @@ def main():
     features = torch.randn(args.n_active, args.c_in, dtype=torch.float32, device=device) * 0.1
     filters = torch.randn(args.kv, args.c_in, args.c_out, dtype=torch.float32, device=device) * 0.1
     ip, ipn = make_subm_pairs(args.n_active, args.kv, args.density, device)
+    block_m = 16
+    num_tiles = (args.n_active + block_m - 1) // block_m
 
     print(f"\n=== N={args.n_active}  C_IN={args.c_in}  C_OUT={args.c_out}  KV={args.kv}  density={args.density} ===")
 
-    # Kpipe BK16 baseline
+    # --- Shared preprocessing (done once) ---
+    hip = _get_hip_module()
+    assert hip is not None
+    _, _, _, mask, _, _, inp_row_lut = hip.build_implicit_gemm_mask(ip, ipn, args.n_active, block_m)
+    features_c = features.contiguous()
+    weights_packed = _pack_weights(filters, 16)
+    lut_flat = inp_row_lut.reshape(-1).contiguous()
+    mask_flat = mask.reshape(-1).contiguous()
+    stream = torch.cuda.current_stream()
+
+    # --- Kpipe BK16 baseline (compile + cache hit) ---
     out_kpipe = implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward(
         features, filters, ip, ipn, args.n_active
     )
     assert out_kpipe is not None, "kpipe BK16 compile failed"
     torch.cuda.synchronize()
 
-    kpipe_us = bench(
-        "kpipe BK16 (Step 5 baseline)",
-        lambda: implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward(
-            features, filters, ip, ipn, args.n_active
-        ),
-        warmup=args.warmup,
-        iters=args.iters,
-    )
+    kpipe_key = ("mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16", args.c_in, args.c_out, args.kv, "f32", 16, "direct")
+    kpipe_launch, _ = MFMA_F32_16X16X4F32_N2_ASHARED_KPIPE_COMPILED_KERNELS[kpipe_key]
+    out_buf = torch.zeros(args.n_active, args.c_out, dtype=torch.float32, device=device)
 
-    # CrossK BK16
-    out_ck16 = implicit_gemm_crossk_forward(features, filters, ip, ipn, args.n_active, block_k=16)
-    if out_ck16 is not None:
+    def run_kpipe():
+        kpipe_launch(features_c, weights_packed, out_buf, lut_flat, mask_flat, num_tiles, args.n_active, stream)
+
+    kpipe_us = bench("kpipe BK16 (Step 5 baseline)", run_kpipe, warmup=args.warmup, iters=args.iters)
+
+    # --- CrossK preprocessing ---
+    mask_2d = mask.reshape(num_tiles, args.kv)
+    active_kv_ids, active_count = _build_active_kv_ids(mask_2d, args.kv)
+    akv_flat = active_kv_ids.reshape(-1).contiguous()
+    acnt_flat = active_count.reshape(-1).contiguous()
+
+    def bench_crossk(block_k, label):
+        out_ck = implicit_gemm_crossk_forward(features, filters, ip, ipn, args.n_active, block_k=block_k)
+        if out_ck is None:
+            print(f"  {label}: compile failed")
+            return None
         torch.cuda.synchronize()
-        err16 = (out_ck16.float() - out_kpipe.float()).abs().max().item()
-        print(f"  crossk BK16 max error vs kpipe: {err16:.6f}")
-        ck16_us = bench(
-            "crossk BK16",
-            lambda: implicit_gemm_crossk_forward(features, filters, ip, ipn, args.n_active, block_k=16),
-            warmup=args.warmup,
-            iters=args.iters,
-        )
-        print(f"  crossk BK16 vs kpipe BK16: {(ck16_us/kpipe_us - 1)*100:+.1f}%")
-    else:
-        print("  crossk BK16: skipped (c_in constraint)")
+        err = (out_ck.float() - out_kpipe.float()).abs().max().item()
+        print(f"  {label} max error vs kpipe: {err:.6f}")
 
-    # CrossK BK32
+        ck_key = ("crossk", args.c_in, args.c_out, args.kv, "f32", block_k)
+        ck_launch, _ = CROSSK_COMPILED_KERNELS[ck_key]
+        ck_out = torch.zeros(args.n_active, args.c_out, dtype=torch.float32, device=device)
+
+        def run_ck():
+            ck_launch(features_c, weights_packed, ck_out, lut_flat, akv_flat, acnt_flat, num_tiles, args.n_active, stream)
+
+        ck_us = bench(label, run_ck, warmup=args.warmup, iters=args.iters)
+        print(f"  {label} vs kpipe BK16: {(ck_us/kpipe_us - 1)*100:+.1f}%")
+        return ck_us
+
+    bench_crossk(16, "crossk BK16")
+
     if args.c_in >= 32 and args.c_in % 32 == 0:
-        out_ck32 = implicit_gemm_crossk_forward(features, filters, ip, ipn, args.n_active, block_k=32)
-        if out_ck32 is not None:
-            torch.cuda.synchronize()
-            err32 = (out_ck32.float() - out_kpipe.float()).abs().max().item()
-            print(f"  crossk BK32 max error vs kpipe: {err32:.6f}")
-            ck32_us = bench(
-                "crossk BK32",
-                lambda: implicit_gemm_crossk_forward(features, filters, ip, ipn, args.n_active, block_k=32),
-                warmup=args.warmup,
-                iters=args.iters,
-            )
-            print(f"  crossk BK32 vs kpipe BK16: {(ck32_us/kpipe_us - 1)*100:+.1f}%")
-    else:
-        print("  crossk BK32: skipped (c_in < 32 or not divisible)")
+        bench_crossk(32, "crossk BK32")
 
-    # CrossK BK64
     if args.c_in >= 64 and args.c_in % 64 == 0:
-        out_ck64 = implicit_gemm_crossk_forward(features, filters, ip, ipn, args.n_active, block_k=64)
-        if out_ck64 is not None:
-            torch.cuda.synchronize()
-            err64 = (out_ck64.float() - out_kpipe.float()).abs().max().item()
-            print(f"  crossk BK64 max error vs kpipe: {err64:.6f}")
-            ck64_us = bench(
-                "crossk BK64",
-                lambda: implicit_gemm_crossk_forward(features, filters, ip, ipn, args.n_active, block_k=64),
-                warmup=args.warmup,
-                iters=args.iters,
-            )
-            print(f"  crossk BK64 vs kpipe BK16: {(ck64_us/kpipe_us - 1)*100:+.1f}%")
-    else:
-        print("  crossk BK64: skipped (c_in < 64 or not divisible)")
+        bench_crossk(64, "crossk BK64")
 
     print()
 
