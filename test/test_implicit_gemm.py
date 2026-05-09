@@ -377,6 +377,17 @@ class TestImplicitGemmDispatch:
         desp = select_implicit_gemm_kernel(torch.float32, c_in=64, c_out=128)
         assert desp.name == "crossk_pf_xor_bk32"
 
+    def test_very_large_channel_crossk_runtime_skips(self):
+        """crossk descriptor is selected but runtime guard returns None for c_in*c_out > 8192."""
+        from cumm.implicit_gemm import _crossk_pf_xor_bk32_forward
+        import torch
+        features = torch.randn(100, 128, device="cuda")
+        filters = torch.randn(27, 128, 128, device="cuda")
+        ip = torch.zeros(27, 2, 100, dtype=torch.int32, device="cuda")
+        ipn = torch.full((27,), 50, dtype=torch.int32, device="cuda")
+        result = _crossk_pf_xor_bk32_forward(features, filters, ip, ipn, 100)
+        assert result is None, f"Expected None for c_in*c_out={128*128}=16384 > 8192"
+
     def test_small_tile_crossk_descriptor_available(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
 

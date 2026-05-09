@@ -102,6 +102,10 @@ def _crossk_pf_xor_bk32_forward(features, filters, indice_pairs, indice_pair_num
         return None
     if c_in * c_out < 2048:
         return None
+    # Large channels: crossk preprocessing overhead exceeds launch-overhead savings.
+    # Fall back to native (at::mm) until per-KV implicit GEMM is implemented.
+    if c_in * c_out > 8192:
+        return None
     return implicit_gemm_crossk_prefetch_forward(
         features, filters, indice_pairs, indice_pair_num, num_activate_out,
         block_k=32, use_xor_swizzle=True,

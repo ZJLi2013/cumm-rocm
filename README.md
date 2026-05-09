@@ -27,8 +27,16 @@ Drop-in replacement for cumm's `GemmTunerSimple`. Routes to FlyDSL's `hgemm_spli
 
 ### Implicit GEMM (`implicit_gemm.py`)
 
-Fused gather→GEMM→scatter kernels for sparse convolution (`spconv`). The dispatch
-selects the best kernel based on `dtype`, `C_in`, `C_out`, and runtime `KV` count:
+Fused gather→GEMM→scatter kernels for sparse convolution (`spconv`). Three use
+cases drive the kernel design, each with a distinct bottleneck:
+
+| Use Case | Channel Size | Bottleneck | Kernel Strategy | Status |
+|----------|-------------|------------|-----------------|--------|
+| Small-Medium channels | 2048 ≤ C_in×C_out ≤ 8192 | Launch overhead (81 launches) | **Cross-KV fusion**: merge all KV positions into 1 launch | ✅ `crossk_pf_xor_bk32` |
+| Large channels | C_in×C_out > 8192 | HBM bandwidth (temp buffer R/W) | **Per-KV implicit GEMM**: 27 launches but fuse gather+GEMM+scatter | 🔜 planned; falls back to native `at::mm` |
+| Tiny / fallback | Any | Occupancy | Scalar per-thread dot product | ✅ `scalar_tile` |
+
+**Currently implemented kernels:**
 
 | Kernel | Tile | BLOCK_K | Features | Best For |
 |--------|------|---------|----------|----------|
@@ -36,6 +44,11 @@ selects the best kernel based on `dtype`, `C_in`, `C_out`, and runtime `KV` coun
 | `kpipe_bk16` | 16×32 | 16 | K-pipelined, A-shared, vec4 loads | C_in≥4, C_out≥32, small C_in or low KV |
 | `ashared` | 16×32 | — | A in LDS, MFMA | C_in≤16, C_out≥32 |
 | `scalar_tile` | 64×C_out | — | Scalar gather, no MFMA | Universal fallback |
+
+**Per-KV implicit GEMM** (planned): for large channels (e.g. 64→128), each KV
+position's GEMM is large enough that launch overhead is negligible. The win comes
+from fusing gather+GEMM+scatter to eliminate the temp buffer HBM round-trip.
+Based on `kpipe` with indirect A-load and scatter epilogue, 27 launches per conv.
 
 Dispatch logic (automatic, or override via `CUMM_IMPLICIT_GEMM_KERNEL` env var):
 
@@ -45,8 +58,13 @@ C_in ≥ 32, C_out % 32 = 0: crossk_pf_xor_bk32 → kpipe_bk16 → scalar_tile
 Other:                      scalar_tile
 ```
 
-`crossk_pf_xor_bk32` has runtime guards (KV≥15, C_in×C_out≥2048) — if not met
-it returns `None` and the dispatch automatically falls through to the next candidate.
+`crossk_pf_xor_bk32` has runtime guards — if not met it returns `None` and the
+dispatch automatically falls through to the next candidate:
+- `C_in × C_out < 2048`: too small, crossk tile underutilized
+- `C_in × C_out > 8192`: too large, crossk preprocessing overhead exceeds
+  launch-overhead savings; falls back to native `at::mm` until per-KV implicit
+  GEMM is implemented
+- `KV < 15`: insufficient cross-KV amortization
 
 ### Performance (vs scalar_tile baseline, KV=27, MI308X gfx942)
 
@@ -186,6 +204,9 @@ cumm-rocm/
 - Implicit GEMM only supports `f32` dtype (f16/bf16 planned).
 - `C_out` must be ≥ 32 for MFMA kernels; smaller sizes fall back to `scalar_tile`.
 - The `crossk` kernel requires `C_in % 32 == 0` and `C_out % 32 == 0`.
+- Large channels (C_in×C_out ≥ ~8K): `crossk` preprocessing overhead can exceed
+  launch-overhead savings. Per-KV implicit GEMM is planned but not yet implemented;
+  spconv falls back to native `at::mm` for these shapes with ~6% overhead.
 - JIT compilation on first call adds ~1-3s latency; subsequent calls use in-memory cache.
   Set `FLYDSL_RUNTIME_ENABLE_CACHE=1` (default) for persistent disk cache.
 
