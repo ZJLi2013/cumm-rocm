@@ -11,7 +11,7 @@ import sys
 
 
 def extract_kernel_counters(workload_dir, label):
-    files = sorted(glob.glob(os.path.join(workload_dir, "out/pmc_*/7d*/*_counter_collection.csv")))
+    files = sorted(glob.glob(os.path.join(workload_dir, "out/pmc_*/*/*_counter_collection.csv")))
     if not files:
         print(f"{label}: no counter CSV found in {workload_dir}")
         return
