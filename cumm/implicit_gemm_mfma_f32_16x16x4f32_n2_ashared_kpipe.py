@@ -584,40 +584,4 @@ def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_forward(
     )
 
 
-def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16_remap_forward(
-    features: torch.Tensor,
-    filters: torch.Tensor,
-    indice_pairs: torch.Tensor,
-    indice_pair_num: torch.Tensor,
-    num_activate_out: int,
-) -> Optional[torch.Tensor]:
-    """Run the BK16 K-pipe kernel with LDS epilogue remap."""
-    return _implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
-        features, filters, indice_pairs, indice_pair_num, num_activate_out, 16, "remap"
-    )
-
-
-def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward(
-    features: torch.Tensor,
-    filters: torch.Tensor,
-    indice_pairs: torch.Tensor,
-    indice_pair_num: torch.Tensor,
-    num_activate_out: int,
-) -> Optional[torch.Tensor]:
-    """Run the f32 16x16x4 MFMA N2 A-shared K-pipe BK32 kernel."""
-    return _implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
-        features, filters, indice_pairs, indice_pair_num, num_activate_out, 32
-    )
-
-
-def implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_forward(
-    features: torch.Tensor,
-    filters: torch.Tensor,
-    indice_pairs: torch.Tensor,
-    indice_pair_num: torch.Tensor,
-    num_activate_out: int,
-) -> Optional[torch.Tensor]:
-    """Compatibility alias for the BK32 K-pipe kernel."""
-    return implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_bk32_forward(
-        features, filters, indice_pairs, indice_pair_num, num_activate_out
-    )
+# Experimental: kpipe_bk16_remap, kpipe_bk32, kpipe (no bk suffix) removed.

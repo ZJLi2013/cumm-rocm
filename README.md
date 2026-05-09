@@ -38,12 +38,15 @@ cases drive the kernel design, each with a distinct bottleneck:
 
 **Currently implemented kernels:**
 
-| Kernel | Tile | BLOCK_K | Features | Best For |
-|--------|------|---------|----------|----------|
-| `crossk_pf_xor_bk32` | 16×32 | 32 | Cross-KV fusion, prefetch, XOR swizzle | C_in≥32, C_out≥32, KV≥15 |
-| `kpipe_bk16` | 16×32 | 16 | K-pipelined, A-shared, vec4 loads | C_in≥4, C_out≥32, small C_in or low KV |
-| `ashared` | 16×32 | — | A in LDS, MFMA | C_in≤16, C_out≥32 |
-| `scalar_tile` | 64×C_out | — | Scalar gather, no MFMA | Universal fallback |
+| Kernel | Tile | BLOCK_K | Features | Best For | Status |
+|--------|------|---------|----------|----------|--------|
+| `crossk_pf_xor_bk32` | 16×32 | 32 | Cross-KV fusion, prefetch, XOR swizzle | C_in≥32, C_out≥32, KV≥15 | **production** |
+| `kpipe_bk16` | 16×32 | 16 | K-pipelined, A-shared, vec4 loads | C_in≥4, C_out≥32, small C_in or low KV | **production** |
+| `ashared` | 16×32 | — | A in LDS, MFMA | C_in≤16, C_out≥32 | **production** |
+| `scalar_tile` | 64×C_out | — | Scalar gather, no MFMA | Universal fallback | **production** |
+| `n2` | 16×32 | — | 2-wave MFMA, no A-shared | Dispatch fallback only | experimental |
+| `16x16x4f32` | 16×16 | — | Single-wave MFMA | C_out=16 niche | experimental |
+| `32x32x2f32` | 32×32 | — | 32×32 MFMA instruction | Tile-size experiments | experimental |
 
 **Per-KV implicit GEMM** (planned): for large channels (e.g. 64→128), each KV
 position's GEMM is large enough that launch overhead is negligible. The win comes
@@ -163,13 +166,12 @@ cumm-rocm/
 │   ├── implicit_gemm.py               # Kernel family dispatch & descriptor registry
 │   ├── implicit_gemm_common.py         # Shared utilities: mask gen, weight packing
 │   ├── implicit_gemm_scalar_tile.py    # Scalar fallback kernel
-│   ├── implicit_gemm_mfma_f32_16x16x4f32.py          # Single MFMA 16×16
-│   ├── implicit_gemm_mfma_f32_16x16x4f32_n2.py       # 2-wave MFMA
-│   ├── implicit_gemm_mfma_f32_16x16x4f32_n2_ashared.py         # A in LDS
-│   ├── implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe.py   # K-pipelined
-│   ├── implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db.py # Double-buffered
-│   ├── implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_crossk.py  # Cross-KV + prefetch + XOR
-│   ├── implicit_gemm_mfma_f32_32x32x2f32.py          # 32×32 MFMA variant
+│   ├── implicit_gemm_mfma_f32_16x16x4f32.py          # (experimental) Single MFMA 16×16
+│   ├── implicit_gemm_mfma_f32_16x16x4f32_n2.py       # (experimental) 2-wave MFMA
+│   ├── implicit_gemm_mfma_f32_16x16x4f32_n2_ashared.py         # A in LDS (production)
+│   ├── implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe.py   # K-pipelined, kpipe_bk16 (production)
+│   ├── implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_crossk.py  # Cross-KV + prefetch + XOR (production)
+│   ├── implicit_gemm_mfma_f32_32x32x2f32.py          # (experimental) 32×32 MFMA variant
 │   ├── gemm_tuner.py                  # Dense GEMM (FlyDSL hgemm_splitk wrapper)
 │   └── csrc_hip/                      # C++/HIP mask generation & hash table
 ├── test/
