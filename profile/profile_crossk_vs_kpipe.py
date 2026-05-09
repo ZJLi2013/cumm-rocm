@@ -73,6 +73,7 @@ def main():
         CROSSK_COMPILED_KERNELS,
         _build_active_kv_ids,
         implicit_gemm_crossk_forward,
+        implicit_gemm_crossk_prefetch_forward,
     )
 
     torch.manual_seed(0)
@@ -145,6 +146,30 @@ def main():
 
     if args.c_in >= 64 and args.c_in % 64 == 0:
         bench_crossk(64, "crossk BK64")
+
+    # --- CrossK Prefetch variants ---
+    def bench_crossk_pf(block_k, label):
+        out_pf = implicit_gemm_crossk_prefetch_forward(features, filters, ip, ipn, args.n_active, block_k=block_k)
+        if out_pf is None:
+            print(f"  {label}: compile failed")
+            return None
+        torch.cuda.synchronize()
+        err = (out_pf.float() - out_kpipe.float()).abs().max().item()
+        print(f"  {label} max error vs kpipe: {err:.6f}")
+
+        pf_key = ("crossk_pf", args.c_in, args.c_out, args.kv, "f32", block_k)
+        pf_launch, _ = CROSSK_COMPILED_KERNELS[pf_key]
+        pf_out = torch.zeros(args.n_active, args.c_out, dtype=torch.float32, device=device)
+
+        def run_pf():
+            pf_launch(features_c, weights_packed, pf_out, lut_flat, akv_flat, acnt_flat, num_tiles, args.n_active, stream)
+
+        pf_us = bench(label, run_pf, warmup=args.warmup, iters=args.iters)
+        print(f"  {label} vs kpipe BK16: {(pf_us/kpipe_us - 1)*100:+.1f}%")
+        return pf_us
+
+    if args.c_in >= 32 and args.c_in % 32 == 0:
+        bench_crossk_pf(32, "crossk-PF BK32")
 
     print()
 
