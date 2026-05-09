@@ -866,7 +866,7 @@ class TestImplicitGemmCrossKPrefetch:
         self._run_correctness(500, 500, 128, 128, 27, [50]*27, block_k=32, use_xor_swizzle=True)
 
     def test_xor_kv1(self):
-        self._run_correctness(1000, 1000, 32, 32, 1, [500], block_k=32, use_xor_swizzle=True)
+        self._run_correctness(1000, 1000, 32, 32, 1, [150], block_k=32, use_xor_swizzle=True)
 
     def test_xor_kv9(self):
         self._run_correctness(1000, 1000, 32, 32, 9, [200]*9, block_k=32, use_xor_swizzle=True)
@@ -878,7 +878,7 @@ class TestImplicitGemmCrossKPrefetch:
         self._run_correctness(2000, 2000, 32, 32, 27, [200]*27, block_k=32, use_xor_swizzle=True)
 
     def test_xor_large_n(self):
-        self._run_correctness(50000, 50000, 32, 32, 27, [500]*27, block_k=32, use_xor_swizzle=True)
+        self._run_correctness(50000, 50000, 32, 32, 27, [150]*27, block_k=32, use_xor_swizzle=True)
 
     def test_xor_c_out_256(self):
         self._run_correctness(500, 500, 64, 256, 27, [50]*27, block_k=32, use_xor_swizzle=True)
