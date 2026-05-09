@@ -37,11 +37,13 @@ def _build_active_kv_ids(mask: torch.Tensor, kv: int):
     """
     num_tiles = mask.shape[0]
     mask_2d = mask.reshape(num_tiles, kv)
-    active_count = (mask_2d != 0).sum(dim=1).to(torch.int32)
-    active_kv_ids = torch.zeros_like(mask_2d)
-    for t in range(num_tiles):
-        ids = torch.nonzero(mask_2d[t], as_tuple=False).squeeze(-1).to(torch.int32)
-        active_kv_ids[t, : ids.shape[0]] = ids
+    active = (mask_2d != 0)
+    active_count = active.sum(dim=1).to(torch.int32)
+    kv_indices = torch.arange(kv, device=mask.device, dtype=torch.int32).unsqueeze(0).expand(num_tiles, -1)
+    large_val = kv
+    sort_key = torch.where(active, kv_indices, torch.full_like(kv_indices, large_val))
+    sorted_ids, _ = sort_key.sort(dim=1)
+    active_kv_ids = torch.where(sorted_ids < kv, sorted_ids, torch.zeros_like(sorted_ids))
     return active_kv_ids.contiguous(), active_count.contiguous()
 
 
