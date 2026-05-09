@@ -39,6 +39,10 @@ from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db import (
     implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db32_forward,
     implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db64_forward,
 )
+from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_crossk import (
+    CROSSK_COMPILED_KERNELS,
+    implicit_gemm_crossk_forward,
+)
 from cumm.implicit_gemm_mfma_f32_32x32x2f32 import (
     MFMA_F32_32X32X2F32_COMPILED_KERNELS,
     _compile_implicit_gemm_mfma_f32_32x32x2f32,
@@ -111,6 +115,7 @@ IMPLICIT_GEMM_KERNELS = {
         implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db64_forward
     ),
     "mfma_f32_32x32x2f32": implicit_gemm_mfma_f32_32x32x2f32_forward,
+    "crossk_bk32": implicit_gemm_crossk_forward,
 }
 
 
