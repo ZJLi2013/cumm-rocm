@@ -377,11 +377,11 @@ class TestImplicitGemmDispatch:
         desp = select_implicit_gemm_kernel(torch.float32, c_in=64, c_out=128)
         assert desp.name == "crossk_pf_xor_bk32"
 
-    def test_small_tile_falls_through_to_kpipe(self):
+    def test_small_tile_crossk_descriptor_available(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
 
         desp = select_implicit_gemm_kernel(torch.float32, c_in=32, c_out=32)
-        assert desp.name == "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16"
+        assert desp.name == "crossk_pf_xor_bk32"
 
     def test_mid_f32_odd_cin_fallback_to_kpipe(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
