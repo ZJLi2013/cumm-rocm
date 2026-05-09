@@ -63,14 +63,12 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
 
     ROW_MAP_ELEMS = BLOCK_M * 2  # safe_row_base[16] + row_valid_i32[16]
     ROW_MAP_BYTES = ROW_MAP_ELEMS * 4
-    A_LDS_STRIDE = BLOCK_K + 1
-    W_LDS_STRIDE = C_OUT_TILE + 1
+    A_LDS_STRIDE = BLOCK_K + 4
     A_STAGE_ELEMS = BLOCK_M * BLOCK_K
     A_STAGE_ELEMS_PADDED = BLOCK_M * A_LDS_STRIDE
     A_STAGE_BYTES = A_STAGE_ELEMS_PADDED * 4
     W_STAGE_ELEMS = BLOCK_K * C_OUT_TILE
-    W_STAGE_ELEMS_PADDED = BLOCK_K * W_LDS_STRIDE
-    W_STAGE_ELEMS_PER_BLOCK = W_STAGE_ELEMS_PADDED * WAVES_PER_BLOCK
+    W_STAGE_ELEMS_PER_BLOCK = W_STAGE_ELEMS * WAVES_PER_BLOCK
     W_STAGE_BYTES = W_STAGE_ELEMS_PER_BLOCK * 4
     EPI_STAGE_ELEMS = BLOCK_M * C_OUT_TILE
     EPI_STAGE_ELEMS_PER_BLOCK = EPI_STAGE_ELEMS * WAVES_PER_BLOCK
@@ -162,7 +160,7 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
         acc_reg = fx.memref_alloca(acc_reg_ty, acc_reg_lay)
         fx.memref_store_vec(zero_acc, acc_reg)
 
-        wave_w_offset = fx.Index(wave_id) * fx.Index(const_expr(W_STAGE_ELEMS_PADDED))
+        wave_w_offset = fx.Index(wave_id) * fx.Index(const_expr(W_STAGE_ELEMS))
 
         for k in range_constexpr(KV):
             mask_idx = fx.Index(m_tile) * fx.Index(const_expr(KV)) + fx.Index(const_expr(k))
@@ -314,7 +312,7 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                                 w_vec = wp_.vec_load((w_src,), const_expr(W_VEC))
                                 w_lds_base = (
                                     wave_w_offset
-                                    + w_k_idx * fx.Index(const_expr(W_LDS_STRIDE))
+                                    + w_k_idx * fx.Index(const_expr(C_OUT_TILE))
                                     + w_col_vec * fx.Index(const_expr(W_VEC))
                                 )
                                 for vi in range_constexpr(W_VEC):
@@ -352,12 +350,7 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                                 )
                                 b_val = wp_.load(w_src)
                                 b_val = arith.select(c_valid, b_val, zero_f32)
-                                w_lds.store(
-                                    wave_w_offset
-                                    + w_k_idx * fx.Index(const_expr(W_LDS_STRIDE))
-                                    + w_col_idx,
-                                    b_val,
-                                )
+                                w_lds.store(wave_w_offset + w_elem_idx, b_val)
                                 scf.YieldOp([])
                     gpu.barrier()
 
@@ -370,8 +363,8 @@ def _compile_implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe(
                         a_val = a_lds.load(a_off)
                         b_off = (
                             wave_w_offset
-                            + fx.Index(const_expr(kk * W_LDS_STRIDE))
-                            + fx.Index(mfma_k_lane) * fx.Index(const_expr(W_LDS_STRIDE))
+                            + fx.Index(const_expr(kk * C_OUT_TILE))
+                            + fx.Index(mfma_k_lane) * fx.Index(const_expr(C_OUT_TILE))
                             + fx.Index(mfma_col)
                         )
                         b_val = w_lds.load(b_off)
