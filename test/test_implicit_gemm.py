@@ -371,11 +371,17 @@ class TestImplicitGemmDispatch:
         desp = select_implicit_gemm_kernel(torch.float32, c_in=16, c_out=16)
         assert desp.name == "mfma_f32_16x16x4f32"
 
-    def test_mid_f32_prefers_scalar_until_mfma_wins(self):
+    def test_mid_f32_prefers_crossk_pf_xor(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
 
         desp = select_implicit_gemm_kernel(torch.float32, c_in=32, c_out=32)
-        assert desp.name == "scalar_tile"
+        assert desp.name == "crossk_pf_xor_bk32"
+
+    def test_mid_f32_odd_cin_fallback_to_kpipe(self):
+        from cumm.implicit_gemm import select_implicit_gemm_kernel
+
+        desp = select_implicit_gemm_kernel(torch.float32, c_in=20, c_out=32)
+        assert desp.name == "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16"
 
     def test_f16_uses_scalar_fallback(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
@@ -851,6 +857,31 @@ class TestImplicitGemmCrossKPrefetch:
 
     def test_bk32_xor_large(self):
         self._run_correctness(500, 500, 64, 128, 27, [50]*27, block_k=32, use_xor_swizzle=True)
+
+    # --- Release correctness sweep ---
+    def test_xor_c_in_32_c_out_64(self):
+        self._run_correctness(1000, 1000, 32, 64, 27, [100]*27, block_k=32, use_xor_swizzle=True)
+
+    def test_xor_c_in_128(self):
+        self._run_correctness(500, 500, 128, 128, 27, [50]*27, block_k=32, use_xor_swizzle=True)
+
+    def test_xor_kv1(self):
+        self._run_correctness(1000, 1000, 32, 32, 1, [500], block_k=32, use_xor_swizzle=True)
+
+    def test_xor_kv9(self):
+        self._run_correctness(1000, 1000, 32, 32, 9, [200]*9, block_k=32, use_xor_swizzle=True)
+
+    def test_xor_low_density(self):
+        self._run_correctness(5000, 5000, 64, 128, 27, [10]*27, block_k=32, use_xor_swizzle=True)
+
+    def test_xor_high_density(self):
+        self._run_correctness(2000, 2000, 32, 32, 27, [200]*27, block_k=32, use_xor_swizzle=True)
+
+    def test_xor_large_n(self):
+        self._run_correctness(50000, 50000, 32, 32, 27, [500]*27, block_k=32, use_xor_swizzle=True)
+
+    def test_xor_c_out_256(self):
+        self._run_correctness(500, 500, 64, 256, 27, [50]*27, block_k=32, use_xor_swizzle=True)
 
     def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, block_k=32, use_xor_swizzle=False):
         from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_crossk import (

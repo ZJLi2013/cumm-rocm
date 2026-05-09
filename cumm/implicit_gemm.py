@@ -42,6 +42,7 @@ from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_kpipe_db import (
 from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_crossk import (
     CROSSK_COMPILED_KERNELS,
     implicit_gemm_crossk_forward,
+    implicit_gemm_crossk_prefetch_forward,
 )
 from cumm.implicit_gemm_mfma_f32_32x32x2f32 import (
     MFMA_F32_32X32X2F32_COMPILED_KERNELS,
@@ -91,6 +92,16 @@ class ImplicitGemmKernelDesp:
         return self.tile_n
 
 
+def _crossk_pf_xor_bk32_forward(features, filters, indice_pairs, indice_pair_num, num_activate_out):
+    c_in = features.shape[1]
+    if c_in < 32 or c_in % 32 != 0:
+        return None
+    return implicit_gemm_crossk_prefetch_forward(
+        features, filters, indice_pairs, indice_pair_num, num_activate_out,
+        block_k=32, use_xor_swizzle=True,
+    )
+
+
 IMPLICIT_GEMM_KERNELS = {
     "scalar_tile": implicit_gemm_scalar_tile_forward,
     "mfma_f32_16x16x4f32": implicit_gemm_mfma_f32_16x16x4f32_forward,
@@ -116,10 +127,26 @@ IMPLICIT_GEMM_KERNELS = {
     ),
     "mfma_f32_32x32x2f32": implicit_gemm_mfma_f32_32x32x2f32_forward,
     "crossk_bk32": implicit_gemm_crossk_forward,
+    "crossk_pf_xor_bk32": _crossk_pf_xor_bk32_forward,
 }
 
 
 IMPLICIT_GEMM_KERNEL_DESPS: List[ImplicitGemmKernelDesp] = [
+    ImplicitGemmKernelDesp(
+        name="crossk_pf_xor_bk32",
+        forward=_crossk_pf_xor_bk32_forward,
+        dtype="f32",
+        min_c_in_multiple=32,
+        min_c_out_multiple=32,
+        tile_m=16,
+        tile_n=32,
+        block_k=32,
+        waves=2,
+        ashared=True,
+        epilogue="direct",
+        mfma_shape="16x16x4f32",
+        priority=98,
+    ),
     ImplicitGemmKernelDesp(
         name="mfma_f32_16x16x4f32_n2",
         forward=implicit_gemm_mfma_f32_16x16x4f32_n2_forward,
@@ -329,6 +356,7 @@ def get_implicit_gemm_candidates(dtype, c_in: int, c_out: int) -> List[ImplicitG
         ]
     elif dtype_str == "f32" and c_out % 32 == 0:
         preferred_names = [
+            "crossk_pf_xor_bk32",
             "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16",
             "scalar_tile",
             "mfma_f32_16x16x4f32_n2_ashared",
