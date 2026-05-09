@@ -543,14 +543,19 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
         with ir.InsertionPoint(work_if.then_block):
 
             # === Helper: XOR swizzle for A LDS ===
-            # col_dword is the column offset in dwords within a row.
-            # row_idx is the row index (fx.Index).
-            # Returns swizzled column offset in dwords (fx.Index).
-            def _a_swizzle_col(row_idx, col_dword):
+            # Returns the swizzled base column offset for a vec4 group.
+            # row_idx: row index; vec_group_idx: which vec4 group (== akv).
+            def _a_swizzle_vec_base(row_idx, vec_group_idx):
+                if not USE_XOR:
+                    return vec_group_idx * fx.Index(const_expr(A_VEC))
+                row_mask = fx.Index(arith.andi(row_idx, fx.Index(const_expr(K_SLOTS_16B - 1))))
+                swz_group = fx.Index(arith.xori(vec_group_idx, row_mask))
+                return swz_group * fx.Index(const_expr(A_VEC))
+
+            # Scalar version for MFMA reads (kk + k_lane is not necessarily vec4-aligned).
+            def _a_swizzle_scalar(row_idx, col_dword):
                 if not USE_XOR:
                     return col_dword
-                # XOR on 16B (4-dword) granularity:
-                # group = col_dword / 4; swz_group = group ^ (row & (K_SLOTS-1)); swz_col = swz_group * 4 + col_dword % 4
                 group = col_dword // fx.Index(const_expr(4))
                 row_mask = fx.Index(arith.andi(row_idx, fx.Index(const_expr(K_SLOTS_16B - 1))))
                 swz_group = fx.Index(arith.xori(group, row_mask))
@@ -617,13 +622,12 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
                             + akv * fx.Index(const_expr(A_VEC))
                         )
                         av = feat_.vec_load((fo,), const_expr(A_VEC))
-                        col_base = akv * fx.Index(const_expr(A_VEC))
+                        swz_base = _a_swizzle_vec_base(ari, akv)
+                        ab = ari * fx.Index(const_expr(A_LDS_STRIDE)) + swz_base
                         for vi in range_constexpr(A_VEC):
                             val = vector.extract(av, static_position=[const_expr(vi)], dynamic_position=[])
                             val = arith.select(rv, val, zero_f32)
-                            swz_col = _a_swizzle_col(ari, col_base + fx.Index(const_expr(vi)))
-                            a_off = ari * fx.Index(const_expr(A_LDS_STRIDE)) + swz_col
-                            a_lds.store(a_off, val)
+                            a_lds.store(ab + fx.Index(const_expr(vi)), val)
                         scf.YieldOp([])
 
                 wb = (
@@ -660,7 +664,7 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
             def _mfma():
                 for kk in range_constexpr(0, BLOCK_K, 4):
                     a_col = fx.Index(const_expr(kk)) + fx.Index(mfma_k_lane)
-                    swz_a_col = _a_swizzle_col(fx.Index(mfma_row), a_col)
+                    swz_a_col = _a_swizzle_scalar(fx.Index(mfma_row), a_col)
                     ao = (
                         fx.Index(mfma_row) * fx.Index(const_expr(A_LDS_STRIDE))
                         + swz_a_col
@@ -737,13 +741,12 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
             # === Helper: drain prefetched vecs to LDS ===
             def _drain_to_lds(a_vecs, a_meta, w_vecs, w_meta):
                 for av, (ari, akv, cv) in zip(a_vecs, a_meta):
-                    col_base = akv * fx.Index(const_expr(A_VEC))
+                    swz_base = _a_swizzle_vec_base(ari, akv)
+                    ab = ari * fx.Index(const_expr(A_LDS_STRIDE)) + swz_base
                     for vi in range_constexpr(A_VEC):
                         val = vector.extract(av, static_position=[const_expr(vi)], dynamic_position=[])
                         val = arith.select(cv, val, zero_f32)
-                        swz_col = _a_swizzle_col(ari, col_base + fx.Index(const_expr(vi)))
-                        a_off = ari * fx.Index(const_expr(A_LDS_STRIDE)) + swz_col
-                        a_lds.store(a_off, val)
+                        a_lds.store(ab + fx.Index(const_expr(vi)), val)
                 for wv, (wlb, wvl) in zip(w_vecs, w_meta):
                     for vi in range_constexpr(W_VEC):
                         val = vector.extract(wv, static_position=[const_expr(vi)], dynamic_position=[])
