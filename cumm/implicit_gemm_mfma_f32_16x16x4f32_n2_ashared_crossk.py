@@ -180,7 +180,7 @@ def _compile_crossk(c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int
             akv_idx = fx.Index(m_tile) * fx.Index(const_expr(KV)) + kv_seq
             orig_kv = akv_.load(akv_idx)
 
-            # --- row map reload on kv boundary ---
+            # --- row map reload on kv boundary (no barrier inside) ---
             rm_if = scf.IfOp(kv_changed, results_=[], has_else=False)
             with ir.InsertionPoint(rm_if.then_block):
                 row_tid_valid = arith.cmpi(
@@ -209,8 +209,11 @@ def _compile_crossk(c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int
                         fx.Index(const_expr(BLOCK_M)) + row_idx, row_valid_i32
                     )
                     scf.YieldOp([])
-                gpu.barrier()
                 scf.YieldOp([])
+
+            # Unified barrier: ensures row_map LDS writes visible +
+            # previous iteration's MFMA reads complete before A/W overwrites.
+            gpu.barrier()
 
             # --- A staging (vec4 when BLOCK_K divisible by 4) ---
             if const_expr(A_VEC == 4):
@@ -361,8 +364,6 @@ def _compile_crossk(c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int
                     T.vec(4, T.f32), a_val, b_val, cur_acc, 0, 0, 0
                 )
                 fx.memref_store_vec(new_acc, acc_reg)
-
-            gpu.barrier()
 
         # --- Epilogue: direct store ---
         final_acc = fx.memref_load_vec(acc_reg)
