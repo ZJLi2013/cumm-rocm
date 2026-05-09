@@ -704,8 +704,10 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
                     )
                     safe_fo = arith.select(combined_valid, fo, fx.Index(arith.constant(0, type=T.index)))
                     av = feat_.vec_load((safe_fo,), const_expr(A_VEC))
+                    swz_base = _a_swizzle_vec_base(ari, akv)
+                    ab = ari * fx.Index(const_expr(A_LDS_STRIDE)) + swz_base
                     a_vecs.append(av)
-                    a_meta.append((ari, akv, combined_valid))
+                    a_meta.append((ab, combined_valid))
 
                 w_vecs = []
                 w_meta = []
@@ -740,9 +742,7 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
 
             # === Helper: drain prefetched vecs to LDS ===
             def _drain_to_lds(a_vecs, a_meta, w_vecs, w_meta):
-                for av, (ari, akv, cv) in zip(a_vecs, a_meta):
-                    swz_base = _a_swizzle_vec_base(ari, akv)
-                    ab = ari * fx.Index(const_expr(A_LDS_STRIDE)) + swz_base
+                for av, (ab, cv) in zip(a_vecs, a_meta):
                     for vi in range_constexpr(A_VEC):
                         val = vector.extract(av, static_position=[const_expr(vi)], dynamic_position=[])
                         val = arith.select(cv, val, zero_f32)
