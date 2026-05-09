@@ -80,7 +80,7 @@ def _compile_crossk(c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int
 
     ROW_MAP_ELEMS = BLOCK_M * 2
     ROW_MAP_BYTES = ROW_MAP_ELEMS * 4
-    A_LDS_STRIDE = BLOCK_K + 4 if BLOCK_K == 16 else BLOCK_K
+    A_LDS_STRIDE = BLOCK_K + 4
     A_STAGE_ELEMS = BLOCK_M * BLOCK_K
     A_STAGE_ELEMS_PADDED = BLOCK_M * A_LDS_STRIDE
     A_STAGE_BYTES = A_STAGE_ELEMS_PADDED * 4
