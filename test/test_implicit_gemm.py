@@ -117,11 +117,11 @@ class TestImplicitGemmDispatchDescriptors:
         assert remap.ashared is True
         assert remap.epilogue == "remap"
 
-    def test_dispatch_prefers_bk16_for_mid_channels(self):
+    def test_dispatch_prefers_crossk_for_mid_channels(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
 
         selected = select_implicit_gemm_kernel(torch.float32, 32, 32)
-        assert selected.name == "mfma_f32_16x16x4f32_n2_ashared_kpipe_bk16"
+        assert selected.name == "crossk_pf_xor_bk32"
 
     def test_dispatch_keeps_ashared_for_small_channels(self):
         from cumm.implicit_gemm import select_implicit_gemm_kernel
