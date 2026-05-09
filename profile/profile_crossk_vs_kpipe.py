@@ -171,6 +171,32 @@ def main():
     if args.c_in >= 32 and args.c_in % 32 == 0:
         bench_crossk_pf(32, "crossk-PF BK32")
 
+    # --- CrossK Prefetch XOR swizzle ---
+    def bench_crossk_pf_xor(block_k, label):
+        out_xor = implicit_gemm_crossk_prefetch_forward(
+            features, filters, ip, ipn, args.n_active, block_k=block_k, use_xor_swizzle=True
+        )
+        if out_xor is None:
+            print(f"  {label}: compile failed")
+            return None
+        torch.cuda.synchronize()
+        err = (out_xor.float() - out_kpipe.float()).abs().max().item()
+        print(f"  {label} max error vs kpipe: {err:.6f}")
+
+        xor_key = ("crossk_pf_xor", args.c_in, args.c_out, args.kv, "f32", block_k)
+        xor_launch, _ = CROSSK_COMPILED_KERNELS[xor_key]
+        xor_out = torch.zeros(args.n_active, args.c_out, dtype=torch.float32, device=device)
+
+        def run_xor():
+            xor_launch(features_c, weights_packed, xor_out, lut_flat, akv_flat, acnt_flat, num_tiles, args.n_active, stream)
+
+        xor_us = bench(label, run_xor, warmup=args.warmup, iters=args.iters)
+        print(f"  {label} vs kpipe BK16: {(xor_us/kpipe_us - 1)*100:+.1f}%")
+        return xor_us
+
+    if args.c_in >= 32 and args.c_in % 32 == 0:
+        bench_crossk_pf_xor(32, "crossk-PF-XOR BK32")
+
     print()
 
 

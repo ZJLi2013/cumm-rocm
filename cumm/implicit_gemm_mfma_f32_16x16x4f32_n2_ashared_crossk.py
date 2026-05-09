@@ -417,7 +417,8 @@ def _compile_crossk(c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int
     return launch_fn, BLOCK_M
 
 
-def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int):
+def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int,
+                             use_xor_swizzle: bool = False):
     """Crossk with VMEM-MFMA overlap: issue loads before MFMA, ds_write after."""
     _ensure_flydsl_path()
 
@@ -448,9 +449,12 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
     BLOCK_THREADS = 64 * WAVES_PER_BLOCK
     BLOCKS_PER_KV = C_IN // BLOCK_K
 
+    USE_XOR = use_xor_swizzle
+    K_SLOTS_16B = BLOCK_K * 4 // 16  # number of 16-byte slots per row
+
     ROW_MAP_ELEMS = BLOCK_M * 2
     ROW_MAP_BYTES = ROW_MAP_ELEMS * 4
-    A_LDS_STRIDE = BLOCK_K + 4
+    A_LDS_STRIDE = BLOCK_K if USE_XOR else (BLOCK_K + 4)
     A_STAGE_ELEMS_PADDED = BLOCK_M * A_LDS_STRIDE
     W_STAGE_ELEMS = BLOCK_K * C_OUT_TILE
     W_STAGE_ELEMS_PER_BLOCK = W_STAGE_ELEMS * WAVES_PER_BLOCK
@@ -464,7 +468,7 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
 
     allocator = SmemAllocator(
         None, arch="gfx942",
-        global_sym_name=f"smem_crossk_pf_bk{BLOCK_K}",
+        global_sym_name=f"smem_crossk_pf{'_xor' if USE_XOR else ''}_bk{BLOCK_K}",
     )
     smem_row_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_row_offset + ROW_MAP_BYTES
@@ -538,6 +542,21 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
         work_if = scf.IfOp(has_work, results_=[], has_else=False)
         with ir.InsertionPoint(work_if.then_block):
 
+            # === Helper: XOR swizzle for A LDS ===
+            # col_dword is the column offset in dwords within a row.
+            # row_idx is the row index (fx.Index).
+            # Returns swizzled column offset in dwords (fx.Index).
+            def _a_swizzle_col(row_idx, col_dword):
+                if not USE_XOR:
+                    return col_dword
+                # XOR on 16B (4-dword) granularity:
+                # group = col_dword / 4; swz_group = group ^ (row & (K_SLOTS-1)); swz_col = swz_group * 4 + col_dword % 4
+                group = col_dword // fx.Index(const_expr(4))
+                row_mask = fx.Index(arith.andi(row_idx, fx.Index(const_expr(K_SLOTS_16B - 1))))
+                swz_group = fx.Index(arith.xori(group, row_mask))
+                within = col_dword % fx.Index(const_expr(4))
+                return swz_group * fx.Index(const_expr(4)) + within
+
             # === Helper: compute blk_idx → kv_seq, c_offset, orig_kv ===
             def _blk_params(blk_idx_idx):
                 kv_seq = blk_idx_idx // blocks_per_kv_idx
@@ -598,11 +617,13 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
                             + akv * fx.Index(const_expr(A_VEC))
                         )
                         av = feat_.vec_load((fo,), const_expr(A_VEC))
-                        ab = ari * fx.Index(const_expr(A_LDS_STRIDE)) + akv * fx.Index(const_expr(A_VEC))
+                        col_base = akv * fx.Index(const_expr(A_VEC))
                         for vi in range_constexpr(A_VEC):
                             val = vector.extract(av, static_position=[const_expr(vi)], dynamic_position=[])
                             val = arith.select(rv, val, zero_f32)
-                            a_lds.store(ab + fx.Index(const_expr(vi)), val)
+                            swz_col = _a_swizzle_col(ari, col_base + fx.Index(const_expr(vi)))
+                            a_off = ari * fx.Index(const_expr(A_LDS_STRIDE)) + swz_col
+                            a_lds.store(a_off, val)
                         scf.YieldOp([])
 
                 wb = (
@@ -638,10 +659,11 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
             # === Helper: MFMA on current LDS data ===
             def _mfma():
                 for kk in range_constexpr(0, BLOCK_K, 4):
+                    a_col = fx.Index(const_expr(kk)) + fx.Index(mfma_k_lane)
+                    swz_a_col = _a_swizzle_col(fx.Index(mfma_row), a_col)
                     ao = (
                         fx.Index(mfma_row) * fx.Index(const_expr(A_LDS_STRIDE))
-                        + fx.Index(const_expr(kk))
-                        + fx.Index(mfma_k_lane)
+                        + swz_a_col
                     )
                     av = a_lds.load(ao)
                     bo = (
@@ -678,9 +700,8 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
                     )
                     safe_fo = arith.select(combined_valid, fo, fx.Index(arith.constant(0, type=T.index)))
                     av = feat_.vec_load((safe_fo,), const_expr(A_VEC))
-                    ab = ari * fx.Index(const_expr(A_LDS_STRIDE)) + akv * fx.Index(const_expr(A_VEC))
                     a_vecs.append(av)
-                    a_meta.append((ab, combined_valid))
+                    a_meta.append((ari, akv, combined_valid))
 
                 w_vecs = []
                 w_meta = []
@@ -715,11 +736,14 @@ def _compile_crossk_prefetch(c_in: int, c_out: int, kv: int, dtype_str: str, blo
 
             # === Helper: drain prefetched vecs to LDS ===
             def _drain_to_lds(a_vecs, a_meta, w_vecs, w_meta):
-                for av, (ab, cv) in zip(a_vecs, a_meta):
+                for av, (ari, akv, cv) in zip(a_vecs, a_meta):
+                    col_base = akv * fx.Index(const_expr(A_VEC))
                     for vi in range_constexpr(A_VEC):
                         val = vector.extract(av, static_position=[const_expr(vi)], dynamic_position=[])
                         val = arith.select(cv, val, zero_f32)
-                        a_lds.store(ab + fx.Index(const_expr(vi)), val)
+                        swz_col = _a_swizzle_col(ari, col_base + fx.Index(const_expr(vi)))
+                        a_off = ari * fx.Index(const_expr(A_LDS_STRIDE)) + swz_col
+                        a_lds.store(a_off, val)
                 for wv, (wlb, wvl) in zip(w_vecs, w_meta):
                     for vi in range_constexpr(W_VEC):
                         val = vector.extract(wv, static_position=[const_expr(vi)], dynamic_position=[])
@@ -816,6 +840,7 @@ def implicit_gemm_crossk_prefetch_forward(
     indice_pair_num: torch.Tensor,
     num_activate_out: int,
     block_k: int = 32,
+    use_xor_swizzle: bool = False,
 ) -> Optional[torch.Tensor]:
     """Run the cross-kv K-fused implicit GEMM kernel with prefetch overlap."""
     try:
@@ -852,15 +877,18 @@ def implicit_gemm_crossk_prefetch_forward(
     mask_2d = mask.reshape(num_tiles, kv)
     active_kv_ids, active_count = _build_active_kv_ids(mask_2d, kv)
 
-    key = ("crossk_pf", c_in, c_out, kv, dtype_str, block_k)
+    swz_tag = "_xor" if use_xor_swizzle else ""
+    key = ("crossk_pf" + swz_tag, c_in, c_out, kv, dtype_str, block_k)
     if key not in CROSSK_COMPILED_KERNELS:
         try:
-            launch_fn, block_m = _compile_crossk_prefetch(c_in, c_out, kv, dtype_str, block_k)
+            launch_fn, block_m = _compile_crossk_prefetch(
+                c_in, c_out, kv, dtype_str, block_k, use_xor_swizzle=use_xor_swizzle
+            )
             CROSSK_COMPILED_KERNELS[key] = (launch_fn, block_m)
         except Exception as e:
             import traceback
             warnings.warn(
-                f"Failed to compile crossk prefetch kernel: {e}\n{traceback.format_exc()}"
+                f"Failed to compile crossk prefetch{swz_tag} kernel: {e}\n{traceback.format_exc()}"
             )
             return None
     else:

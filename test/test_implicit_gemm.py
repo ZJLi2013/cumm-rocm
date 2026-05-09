@@ -837,7 +837,22 @@ class TestImplicitGemmCrossKPrefetch:
         except ImportError:
             pytest.skip("FlyDSL not installed")
 
-    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, block_k=32):
+    def test_basic_f32(self):
+        self._run_correctness(100, 100, 32, 32, 3, [30, 50, 20], block_k=16)
+
+    def test_bk32_kv27(self):
+        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, block_k=32)
+
+    def test_bk32_large_channel(self):
+        self._run_correctness(500, 500, 64, 128, 27, [50]*27, block_k=32)
+
+    def test_bk32_xor_swizzle(self):
+        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, block_k=32, use_xor_swizzle=True)
+
+    def test_bk32_xor_large(self):
+        self._run_correctness(500, 500, 64, 128, 27, [50]*27, block_k=32, use_xor_swizzle=True)
+
+    def _run_correctness(self, n_in, n_out, c_in, c_out, kv, nhot_list, block_k=32, use_xor_swizzle=False):
         from cumm.implicit_gemm_mfma_f32_16x16x4f32_n2_ashared_crossk import (
             implicit_gemm_crossk_prefetch_forward,
         )
@@ -856,21 +871,14 @@ class TestImplicitGemmCrossKPrefetch:
 
         ref = _reference_gather_gemm_scatter(features, filters, ip, ipn, n_out)
         out = implicit_gemm_crossk_prefetch_forward(
-            features, filters, ip, ipn, n_out, block_k=block_k
+            features, filters, ip, ipn, n_out, block_k=block_k,
+            use_xor_swizzle=use_xor_swizzle,
         )
-        assert out is not None, f"crossk prefetch bk{block_k} compilation failed"
+        tag = f"crossk-PF bk{block_k}" + (" xor" if use_xor_swizzle else "")
+        assert out is not None, f"{tag} compilation failed"
 
         torch.cuda.synchronize()
         torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
-
-    def test_basic_f32(self):
-        self._run_correctness(100, 100, 32, 32, 3, [30, 50, 20], block_k=16)
-
-    def test_bk32_kv27(self):
-        self._run_correctness(1000, 1000, 32, 32, 27, [100]*27, block_k=32)
-
-    def test_bk32_large_channel(self):
-        self._run_correctness(500, 500, 64, 128, 27, [50]*27, block_k=32)
 
 
 class TestImplicitGemmMfmaF32_16x16x4N2ASharedKPipeDB:
