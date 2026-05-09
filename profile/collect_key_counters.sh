@@ -48,7 +48,7 @@ run_one() {
     local kernel=$1 label=$2 yaml=$3 out_prefix=$4
     echo "=== $label: $kernel ==="
     PYTHONPATH="$ROOT" FLYDSL_RUNTIME_ENABLE_CACHE=0 \
-      rocprofv3 --counter-input "$yaml" \
+      rocprofv3 -i "$yaml" \
         -o "$OUT_DIR/${out_prefix}" \
         -- python "$ROOT/profile/profile_crossk_pf_kernel.py" \
           --kernel "$kernel" --block-k 32 \
