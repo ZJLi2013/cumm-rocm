@@ -209,6 +209,11 @@ cumm-rocm/
 - Large channels (C_in×C_out ≥ ~8K): `crossk` preprocessing overhead can exceed
   launch-overhead savings. Per-KV implicit GEMM is planned but not yet implemented;
   spconv falls back to native `at::mm` for these shapes with ~6% overhead.
+- Experimental kernels (`mfma_f32_16x16x4f32`, `mfma_f32_16x16x4f32_n2`,
+  `mfma_f32_32x32x2f32`) have known correctness issues with overlapping output
+  indices (scatter race). Production dispatch avoids them for shapes covered by
+  `crossk_pf_xor_bk32` / `kpipe_bk16` / `ashared`; they remain in-tree for
+  development reference only.
 - JIT compilation on first call adds ~1-3s latency; subsequent calls use in-memory cache.
   Set `FLYDSL_RUNTIME_ENABLE_CACHE=1` (default) for persistent disk cache.
 
