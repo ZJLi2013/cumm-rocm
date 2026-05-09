@@ -162,17 +162,22 @@ def _compile_crossk(c_in: int, c_out: int, kv: int, dtype_str: str, block_k: int
         wave_w_offset = fx.Index(wave_id) * fx.Index(const_expr(W_STAGE_ELEMS))
 
         n_active = acnt_.load(fx.Index(m_tile))
-        n_blocks = n_active * fx.Int32(const_expr(BLOCKS_PER_KV))
-        blocks_per_kv_const = fx.Int32(const_expr(BLOCKS_PER_KV))
+        n_blocks_i32 = n_active * fx.Int32(const_expr(BLOCKS_PER_KV))
+        n_blocks_idx = fx.Index(arith.index_cast(T.index, n_blocks_i32))
+        zero_idx = fx.Index(arith.constant(0, type=T.index))
+        one_idx = fx.Index(arith.constant(1, type=T.index))
+        blocks_per_kv_idx = fx.Index(const_expr(BLOCKS_PER_KV))
 
-        for blk_idx in range(zero_i32, n_blocks, one_i32):
-            kv_seq = blk_idx // blocks_per_kv_const
-            c_blk_in_kv = blk_idx % blocks_per_kv_const
-            c_offset = c_blk_in_kv * fx.Int32(const_expr(BLOCK_K))
+        for blk_idx in range(zero_idx, n_blocks_idx, one_idx):
+            kv_seq = blk_idx // blocks_per_kv_idx
+            c_blk_in_kv = blk_idx % blocks_per_kv_idx
+            c_offset_idx = c_blk_in_kv * fx.Index(const_expr(BLOCK_K))
+            c_offset = fx.Int32(arith.index_cast(T.i32, c_offset_idx))
 
-            kv_changed = arith.cmpi(arith.CmpIPredicate.eq, c_blk_in_kv, zero_i32)
+            c_blk_zero = fx.Index(arith.constant(0, type=T.index))
+            kv_changed = arith.cmpi(arith.CmpIPredicate.eq, c_blk_in_kv, c_blk_zero)
 
-            akv_idx = fx.Index(m_tile) * fx.Index(const_expr(KV)) + fx.Index(kv_seq)
+            akv_idx = fx.Index(m_tile) * fx.Index(const_expr(KV)) + kv_seq
             orig_kv = akv_.load(akv_idx)
 
             # --- row map reload on kv boundary ---
