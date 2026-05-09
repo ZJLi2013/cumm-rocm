@@ -133,6 +133,9 @@ python profile/profile_full_latency.py --iters 50
 python profile/sweep_crossk.py
 ```
 
+See [`profile/README.md`](profile/README.md) for the full profiling toolkit
+(rocprofv3, hardware counters, bottleneck analysis methodology).
+
 ## Repository Structure
 
 ```
@@ -156,9 +159,14 @@ cumm-rocm/
 │   ├── test_gemm_tuner.py             # Dense GEMM tuner tests
 │   └── bench_implicit_gemm_family.py  # Family-wide benchmark harness
 ├── profile/                           # Profiling & benchmarking scripts
-│   ├── profile_crossk_vs_kpipe.py     # Kernel-only A/B comparison
+│   ├── README.md                      # Profiling toolkit docs & counter reference
+│   ├── profile_crossk_vs_kpipe.py     # Kernel-only A/B comparison (primary benchmark)
 │   ├── profile_full_latency.py        # End-to-end latency (preprocessing + kernel)
-│   └── sweep_crossk.py               # Multi-config sweep
+│   ├── profile_kpipe_kernel.py        # kpipe-specific kernel driver
+│   ├── sweep_crossk.py               # Multi-config crossk sweep
+│   ├── run_rocprofv3_kpipe.sh         # rocprofv3 trace wrapper
+│   ├── run_rocprof_compute_kpipe.sh   # Hardware counter collection wrapper
+│   └── extract_counters.py            # Counter extraction & A/B comparison
 └── scripts/
     └── run_implicit_gemm_family_test.sh
 ```
