@@ -94,7 +94,13 @@ class ImplicitGemmKernelDesp:
 
 def _crossk_pf_xor_bk32_forward(features, filters, indice_pairs, indice_pair_num, num_activate_out):
     c_in = features.shape[1]
+    c_out = filters.shape[2]
+    kv = filters.shape[0]
     if c_in < 32 or c_in % 32 != 0:
+        return None
+    if kv < 15:
+        return None
+    if c_in * c_out < 2048:
         return None
     return implicit_gemm_crossk_prefetch_forward(
         features, filters, indice_pairs, indice_pair_num, num_activate_out,
