@@ -34,7 +34,7 @@ echo "=== rocprofv3 kernel trace: 64x128 ==="
 mkdir -p /tmp/kpipe_step7
 FLYDSL_RUNTIME_ENABLE_CACHE=0 rocprofv3 --kernel-trace \
   -o /tmp/kpipe_step7/trace_64x128 \
-  python /tmp/cumm-rocm/profile/profile_kpipe_kernel.py \
+  -- python /tmp/cumm-rocm/profile/profile_kpipe_kernel.py \
   --variant direct --n-active 20000 --c-in 64 --c-out 128 --iters 20 --warmup 5
 echo "--- trace results ---"
 python3 -c "
