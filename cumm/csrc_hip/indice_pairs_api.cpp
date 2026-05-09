@@ -5,13 +5,6 @@
 
 namespace cumm_hip {
 
-template <typename K>
-void generate_subm_conv_inds(
-    const int* indices_in, int* indice_pairs, int* indice_num_per_loc,
-    int num_act_in, int batch_size,
-    const int* input_dims_h, const int* ksize_h, const int* dilation_h,
-    int ndim, hipStream_t stream);
-
 void build_implicit_gemm_mask_gpu(
     const int* indice_pairs, const int* indice_pair_num,
     int kv, int N, int num_act_out, int block_m,
@@ -22,53 +15,6 @@ void build_implicit_gemm_mask_gpu(
     hipStream_t stream);
 
 }  // namespace cumm_hip
-
-static bool check_use_int32(const std::vector<int>& spatial_shape, int batch_size) {
-    int64_t vol = (int64_t)batch_size;
-    for (int d : spatial_shape) vol *= d;
-    return vol < (int64_t)std::numeric_limits<int32_t>::max();
-}
-
-// SubM indice pairs (same interface as spconv_rocm).
-// Returns: (indice_pairs [2, kv, N], indice_pair_num [kv])
-std::vector<torch::Tensor> get_indice_pairs_subm(
-    torch::Tensor indices,
-    int batch_size,
-    std::vector<int> spatial_shape,
-    std::vector<int> ksize,
-    std::vector<int> dilation)
-{
-    TORCH_CHECK(indices.is_cuda(), "indices must be on GPU");
-    TORCH_CHECK(indices.scalar_type() == torch::kInt32, "indices must be int32");
-
-    int ndim = (int)spatial_shape.size();
-    int N = indices.size(0);
-    int kv = 1;
-    for (int k : ksize) kv *= k;
-
-    auto options = torch::TensorOptions().dtype(torch::kInt32).device(indices.device());
-    auto indice_pairs = torch::full({2, kv, N}, -1, options);
-    auto indice_pair_num = torch::zeros({kv}, options);
-
-    hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
-
-    bool use_i32 = check_use_int32(spatial_shape, batch_size);
-    if (use_i32) {
-        cumm_hip::generate_subm_conv_inds<int32_t>(
-            indices.data_ptr<int>(), indice_pairs.data_ptr<int>(),
-            indice_pair_num.data_ptr<int>(), N, batch_size,
-            spatial_shape.data(), ksize.data(), dilation.data(),
-            ndim, stream);
-    } else {
-        cumm_hip::generate_subm_conv_inds<int64_t>(
-            indices.data_ptr<int>(), indice_pairs.data_ptr<int>(),
-            indice_pair_num.data_ptr<int>(), N, batch_size,
-            spatial_shape.data(), ksize.data(), dilation.data(),
-            ndim, stream);
-    }
-
-    return {indice_pairs, indice_pair_num};
-}
 
 // Build mask for output-tile-centric implicit GEMM.
 // Input: indice_pairs [kv, 2, N], indice_pair_num [kv], num_act_out, block_m
@@ -135,8 +81,6 @@ std::vector<torch::Tensor> build_implicit_gemm_mask(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("get_indice_pairs_subm", &get_indice_pairs_subm,
-          "SubM conv indice pairs (HIP kernel)");
     m.def("build_implicit_gemm_mask", &build_implicit_gemm_mask,
           "Build mask for output-tile-centric implicit GEMM");
 }
